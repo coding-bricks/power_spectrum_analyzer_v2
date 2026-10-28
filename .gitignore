@@ -1,0 +1,28 @@
+__pycache__/
+
+# Temporary files
+*.pyc
+*~
+*.py~
+
+# Emacs temporary files
+\#*\#
+
+# Data files
+*.fits*
+
+# Other files
+*.sh
+*.py_old
+config.py
+requirements.txt
+requirements.lock.txt
+
+# Other folders
+*.egg-info/
+
+# Virtual Environments
+.venv/
+
+build/**
+old/
