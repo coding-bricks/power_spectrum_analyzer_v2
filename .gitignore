@@ -23,6 +23,7 @@ requirements.lock.txt
 
 # Virtual Environments
 .venv/
+.vscode/
 
 build/**
 old/
