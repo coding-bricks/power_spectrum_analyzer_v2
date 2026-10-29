@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "power-spectrum-analyzer"
+version = "0.1.0"
+description = "High-performance RFI identification, spectrum analysis, and signal cleaning suite for radio astronomy data"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # --- SCIENTIFIC & DSP CORE ---
+    "numpy>=1.26.0,<2.0.0",
+    "scipy>=1.11.0",
+    "astropy>=6.0.0,<7.0.0",
+
+    # --- GUI & VISUALIZATION ---
+    "PyQt5>=5.15.0,<6.0.0",
+    "matplotlib>=3.8.0,<4.0.0",
+    "Pillow",
+
+    # --- UTILITIES ---
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyqt5-tools>=5.15.9",
+]
+
+[project.scripts]
+psa = "power_spectrum_analyzer.psa_gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+power_spectrum_analyzer = [
+    "config.ini",
+    "gui/*.ui",
+    "gui/*.png",
+    "gui/*.html"
+]
