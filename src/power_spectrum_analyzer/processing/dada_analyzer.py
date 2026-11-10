@@ -1,18 +1,12 @@
 import numpy as np
+import scipy.fft
 import time
 import concurrent.futures
 import os
 
-#from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtCore import pyqtSignal, QThread
-
 from scipy.signal import medfilt
 
-
-import os
-import concurrent.futures
-
-import scipy.fft
 
 
 class CreateRawSpectrum(QThread):
@@ -22,6 +16,8 @@ class CreateRawSpectrum(QThread):
     update_progressbar_value = pyqtSignal(int)
     update_progressbar_range = pyqtSignal(int, int)
     result_signal_psd = pyqtSignal(object, object, object, object)
+
+    
 
     def __init__(self, iterations, npoints, nchan, data, 
                  enable_chunking=True, max_iterations=156250, num_blocks=1, parent=None):
@@ -35,6 +31,8 @@ class CreateRawSpectrum(QThread):
         self.enable_chunking = enable_chunking
         self.max_iterations = max_iterations
         self.num_blocks = num_blocks
+
+    
 
     def run(self):
         t_start_total = time.perf_counter()
@@ -115,180 +113,6 @@ class CreateRawSpectrum(QThread):
 
 
 
-
-
-class CreateRawSpectrum___(QThread):
-
-    update_button_signal = pyqtSignal(bool)
-    update_statusbar_signal = pyqtSignal(str)
-    update_progressbar_value = pyqtSignal(int)
-    update_progressbar_range = pyqtSignal(int, int)
-    result_signal_psd = pyqtSignal(object, object, object, object)
-
-    def __init__(self, iterations, npoints, nchan, data, 
-                 enable_chunking=True, max_iterations=156250, num_blocks=1, parent=None):
-        super().__init__(parent)
-
-        self.iterations = iterations
-        self.npoints = npoints
-        self.nchan = nchan
-        self.data = data
-        
-        # --- PARAMETRI CHUNKING DINAMICO ---
-        self.enable_chunking = enable_chunking
-        self.max_iterations = max_iterations
-        self.num_blocks = num_blocks
-
-
-    def _extract_subset(self, rows_per_step):
-        """
-        Estrae il subset contiguo esatto richiesto dall'utente (es. prime N iterazioni).
-        """
-        actual_iters = min(self.iterations, self.max_iterations if self.enable_chunking else self.iterations)
-        subset_data = self.data[:actual_iters * rows_per_step].reshape(actual_iters, rows_per_step, 4)
-        return subset_data, actual_iters
-
-
-
-    def _extract_strided_blocks__(self, rows_per_step):
-        """
-        Estrae num_blocks distribuiti uniformemente lungo l'INTERO file DADA
-        (es. da 0 a 156.000 iterazioni).
-        """
-        total_iters = self.iterations
-        
-        if total_iters <= self.max_iterations:
-            subset_data = self.data[:total_iters * rows_per_step].reshape(total_iters, rows_per_step, 4)
-            return subset_data, total_iters
-
-        block_size = self.max_iterations // self.num_blocks
-        
-        # Genera i punti di partenza equispaziati tra 0 e l'ultimo blocco possibile dell'INTERO file
-        starts = np.linspace(0, total_iters - block_size, self.num_blocks, dtype=int)
-        
-        selected_chunks = []
-        for start in starts:
-            end = start + block_size
-            chunk = self.data[start * rows_per_step : end * rows_per_step].reshape(block_size, rows_per_step, 4)
-            selected_chunks.append(chunk)
-            
-        subset_data = np.concatenate(selected_chunks, axis=0)
-        actual_iters = subset_data.shape[0]
-        
-        return subset_data, actual_iters
-
-
-
-
-
-    def _extract_strided_blocks_old(self, rows_per_step):
-        """
-        Estrae num_blocks distribuiti uniformemente lungo l'osservazione DADA.
-        Ritorna la matrice data_reshaped contenente solo le iterazioni selezionate.
-        """
-        total_iters = self.iterations
-        
-        if total_iters <= self.max_iterations:
-            # Se le iterazioni totali sono già poche, prendiamo tutto
-            subset_data = self.data[:total_iters * rows_per_step].reshape(total_iters, rows_per_step, 4)
-            return subset_data, total_iters
-
-        block_size = self.max_iterations // self.num_blocks
-        starts = np.linspace(0, total_iters - block_size, self.num_blocks, dtype=int)
-        
-        selected_chunks = []
-        for start in starts:
-            end = start + block_size
-            chunk = self.data[start * rows_per_step : end * rows_per_step].reshape(block_size, rows_per_step, 4)
-            selected_chunks.append(chunk)
-            
-        # Concateniamo i blocchi campionati in un'unica matrice
-        subset_data = np.concatenate(selected_chunks, axis=0)
-        actual_iters = subset_data.shape[0]
-        
-        return subset_data, actual_iters
-
-
-    def run(self):
-        t_start_total = time.perf_counter()
-
-        # Determina le iterazioni effettive da elaborare (subset contiguo iniziale)
-        if self.enable_chunking and self.iterations > self.max_iterations:
-            processed_iters = self.max_iterations
-            mode_str = f"SUBSET CONTIGUO ({processed_iters} iterazioni)"
-        else:
-            processed_iters = self.iterations
-            mode_str = f"FULL ({processed_iters} iterazioni)"
-
-        self.update_statusbar_signal.emit(f'FFT calculation started [{mode_str}]...')   
-        self.update_button_signal.emit(False)     
-
-        rows_per_step = self.npoints  # 1024
-
-        # 1. Reshape e centraggio a float32 sul solo subset contiguo selezionato
-        t0 = time.perf_counter()
-        data = self.data[:processed_iters * rows_per_step].reshape(processed_iters, rows_per_step, 4)
-        
-        # Estrazione I/Q e centraggio su 128
-        i0 = data[:, :, 0].astype(np.float32) - 128.0
-        q0 = data[:, :, 1].astype(np.float32) - 128.0
-        i1 = data[:, :, 2].astype(np.float32) - 128.0
-        q1 = data[:, :, 3].astype(np.float32) - 128.0
-        t_prep = time.perf_counter() - t0
-
-        # 2. Costruzione del segnale complesso
-        t0 = time.perf_counter()
-        complex_pol0 = i0 + 1j * q0
-        complex_pol1 = i1 + 1j * q1
-        t_complex = time.perf_counter() - t0
-
-        # 3. Calcolo FFT su asse frequenza (axis=1)
-        t0 = time.perf_counter()
-        fft_array_pol0 = np.fft.fft(complex_pol0, axis=1)
-        fft_array_pol1 = np.fft.fft(complex_pol1, axis=1)
-        t_fft = time.perf_counter() - t0
-
-        # 4. Spettro di potenza (PSD) e Media integrata
-        t0 = time.perf_counter()
-        self.update_statusbar_signal.emit('FFT calculation completed. Squaring coefficients...')
-        self.update_progressbar_range.emit(0, 0)
-
-        pol0_psd_tot = np.mean(fft_array_pol0.real**2 + fft_array_pol0.imag**2, axis=0)
-        pol1_psd_tot = np.mean(fft_array_pol1.real**2 + fft_array_pol1.imag**2, axis=0)
-        t_psd = time.perf_counter() - t0
-
-        t_total = time.perf_counter() - t_start_total
-
-        # --- TRACCIAMENTO TEMPI E BENCHMARK ---
-        print("\n=== BENCHMARK SPETTRO GREZZO (CreateRawSpectrum) ===")
-        print(f" Modalita Esecuzione:                {mode_str}")
-        print(f" Iterazioni Totali File DADA:        {self.iterations}")
-        print(f" Iterazioni Realmente Elaborate:    {processed_iters} ({(processed_iters/self.iterations)*100:.1f}% dei dati)")
-        print(f" 1. Preparazione Dati e Centraggio: {t_prep:.3f} s")
-        print(f" 2. Costruzione Segnale Complesso:   {t_complex*1000:.2f} ms")
-        print(f" 3. Calcolo FFT (Pol0 + Pol1):       {t_fft:.3f} s")
-        print(f" 4. Calcolo PSD e Integrazione Media:{t_psd*1000:.2f} ms")
-        print(f"----------------------------------------------------------")
-        print(f" TEMPO TOTALE SPETTRO GREZZO:        {t_total:.3f} s")
-        print("==========================================================\n")
-
-        # Store results
-        self.fft_array_pol0 = fft_array_pol0
-        self.fft_array_pol1 = fft_array_pol1
-        self.pol0_psd_tot = pol0_psd_tot
-        self.pol1_psd_tot = pol1_psd_tot
-
-        self.update_statusbar_signal.emit('Power Spectrum ready.')
-        self.update_progressbar_value.emit(processed_iters)
-
-        self.result_signal_psd.emit(self.pol0_psd_tot, self.pol1_psd_tot, fft_array_pol0, fft_array_pol1)
-
-        self.update_button_signal.emit(True)  
-        self.update_progressbar_range.emit(0, 100)
-        self.update_progressbar_value.emit(100)
-
-
-
 class CreateFilteredSpectrum(QThread):
 
     update_button_signal = pyqtSignal(bool)
@@ -299,6 +123,7 @@ class CreateFilteredSpectrum(QThread):
 
     # --- NUOVO SEGNALE DEDICATO PER I DATI RIPARATI NEL TEMPO ---
     result_signal_time_clean = pyqtSignal(object, object)
+
 
 
     def __init__(self, raw_data, total_iterations, npoints, 
@@ -316,6 +141,8 @@ class CreateFilteredSpectrum(QThread):
             self.subset_iterations = fft_raw_pol0.shape[0]
         else:
             self.subset_iterations = total_iterations
+
+    
 
     def _find_safe_channels_fast(self, outliers_indices, nchan=1024, min_dist=5):
         if not outliers_indices:
@@ -342,7 +169,7 @@ class CreateFilteredSpectrum(QThread):
 
         return safe_channels
 
-
+    
 
     def _repair_polarization_vectorized(self, fft_data, outliers_indices, safe_channels):
         if not outliers_indices:
@@ -367,8 +194,8 @@ class CreateFilteredSpectrum(QThread):
 
         return clean_fft
 
-
     
+
     def _repair_time_domain_vectorized(self, fft_data, threshold=3.0):
         """
         Riparazione RFI temporale via Random Donor Subset.
@@ -407,91 +234,6 @@ class CreateFilteredSpectrum(QThread):
 
         return clean_fft
      
-       
-    def _repair_time_domain_vectorized___(self, fft_data, threshold=3.0):
-        """
-        Riparazione RFI temporale via Reference Block Copy (Donor fissa iniziale).
-        Usa le prime iterazioni sane come profilo di riferimento immutabile:
-        - Velocità di esecuzione ISTANTANEA.
-        - Zero artefatti spettrali.
-        - Serie Temporale 1D perfettamente pulita.
-        """
-        clean_fft = fft_data.copy()
-        n_iters, n_chan = fft_data.shape
-
-        # 1. Calcolo veloce della Serie Temporale Integrata 1D
-        power_2d = clean_fft.real**2 + clean_fft.imag**2
-        time_series = np.mean(power_2d, axis=1)
-
-        med_ts = np.median(time_series)
-        mad_ts = np.median(np.abs(time_series - med_ts)) + 1e-9
-        mod_z_ts = 0.6745 * (time_series - med_ts) / mad_ts
-
-        # 2. Individuazione delle iterazioni anomale
-        bad_time_mask = np.abs(mod_z_ts) > threshold
-        bad_time_indices = np.where(bad_time_mask)[0]
-
-        print(f"\n[Fixed Donor QA] Iterazioni anomale rimosse: {len(bad_time_indices)} / {n_iters}")
-
-        if len(bad_time_indices) > 0:
-            # PRENDIAMO COME RIFERIMENTO SANO LA PRIMA ITERAZIONE (o la media delle prime 10)
-            # Se la prima iterazione fosse anomala, prendiamo la prima riga sana disponibile
-            first_good_idx = 0
-            if bad_time_mask[0]:
-                good_candidates = np.where(~bad_time_mask)[0]
-                first_good_idx = good_candidates[0] if len(good_candidates) > 0 else 0
-
-            # Vettore complessi FFT di riferimento (Prima iterazione sana)
-            reference_vector = clean_fft[first_good_idx, :]
-
-            # SOSTITUZIONE ISTANTANEA A BLOCCO DI TUTTE LE ITERAZIONI ANOMALE
-            clean_fft[bad_time_indices, :] = reference_vector
-
-        return clean_fft
-
-
-
-
-
-    def _repair_time_domain_vectorized__(self, fft_data, threshold=3.0):
-        """
-        Riparazione RFI temporali 2D mediante Noise Replacement coerente.
-        Elimina gli spike positivi senza creare buchi o spike negativi nella serie temporale.
-        """
-        clean_fft = fft_data.copy()
-        power_2d = clean_fft.real**2 + clean_fft.imag**2
-
-        # 1. Identifichiamo le iterazioni globalmente infette
-        time_series = np.mean(power_2d, axis=1)
-        med_ts = np.median(time_series)
-        mad_ts = np.median(np.abs(time_series - med_ts)) + 1e-9
-        mod_z_ts = 0.6745 * (time_series - med_ts) / mad_ts
-
-        # Iterazioni sane da cui estrarre la statistica di rumore pura
-        good_indices = np.where(mod_z_ts <= threshold)[0]
-        bad_indices = np.where(mod_z_ts > threshold)[0]
-
-        print(f"\n[Time-Domain QA] Iterazioni corrotte rimosse e rigenerate: {len(bad_indices)} / {fft_data.shape[0]}")
-
-        if len(bad_indices) > 0 and len(good_indices) > 0:
-            # Calcolo media e deviazione standard reali/immaginarie dai canali e dai tempi sani
-            mean_real = np.mean(clean_fft[good_indices, :].real, axis=0)
-            std_real = np.std(clean_fft[good_indices, :].real, axis=0)
-            mean_imag = np.mean(clean_fft[good_indices, :].imag, axis=0)
-            std_imag = np.std(clean_fft[good_indices, :].imag, axis=0)
-
-            # Generazione del rumore sostitutivo Gaussiano
-            rng = np.random.default_rng()
-            rand_real = rng.normal(mean_real, std_real, size=(len(bad_indices), fft_data.shape[1])).astype(np.float32)
-            rand_imag = rng.normal(mean_imag, std_imag, size=(len(bad_indices), fft_data.shape[1])).astype(np.float32)
-
-            # Iniezione del rumore sano al posto dei dati infetti
-            clean_fft[bad_indices, :] = rand_real + 1j * rand_imag
-
-        return clean_fft
-
-
-  
 
 
     def run(self):
@@ -584,6 +326,8 @@ class DetectOutliers(QThread):
     update_progressbar_range = pyqtSignal(int, int)
     outliers_signal_psd = pyqtSignal(object, object)
 
+    
+
     def __init__(self, power_spectrum_pol0, chunk_size_pol0, threshold_pol0,
                  power_spectrum_pol1, chunk_size_pol1, threshold_pol1, enable_flattening=True, parent=None):
         super().__init__(parent)
@@ -617,7 +361,6 @@ class DetectOutliers(QThread):
         
         # Spettro appiattito centrato attorno a 1.0
         return spectrum / baseline
-
 
 
     
@@ -695,249 +438,6 @@ class DetectOutliers(QThread):
 
  
 
-
-
-
-    def _find_outliers_old(self, spectrum, chunk_size, threshold):
-        """
-        Rilevamento chirurgico ed adattivo degli outlier spettrali (RFI):
-        - Rileva picchi principali tramite Modified Z-Score sul gradiente/residuo.
-        - Per spike singoli di 1 canale: isola solo quel canale senza intaccare i vicini sani.
-        - Per picchi complessi/multicanale: segue la discesa del profilo (shoulder)
-          fino al rientro nella baseline sana (shoulder_threshold).
-        """
-        spectrum = np.array(spectrum, dtype=np.float64)
-        nchan = len(spectrum)
-        guard_band = 20  # Ignora bordi estremi della banda
-
-        # 1. Stima e eventuale appiattimento della baseline
-        if self.enable_flattening:
-            # Richiama il metodo ad-hoc se il flag è True
-            flat_spec = self._flatten_spectrum(spectrum, window_len=101)
-        else:
-            # Comportamento originale
-            baseline = medfilt(spectrum, kernel_size=31)
-            baseline = np.maximum(baseline, 1e-9)
-            flat_spec = spectrum / baseline
-
-        
-        # =====================================================================
-        # STAMPA A VIDEO DEI 1024 VALORI (spectrum / baseline)
-        # =====================================================================
-        print("\n" + "="*80)
-        print(" DIAGNOSTICA SPETTRO APPIATTITO (flat_spec = spectrum / baseline)")
-        print(f" Statistica 1024 Canali -> Media: {np.mean(flat_spec):.4f} | Mediana: {np.median(flat_spec):.4f} | Min: {np.min(flat_spec):.4f} | Max: {np.max(flat_spec):.4f}")
-        print("="*80)
-        
-        # Stampa dei 1024 valori organizzati in righe da 16 canali per facilitare la lettura
-        for i in range(0, nchan, 16):
-            chunk_vals = " ".join([f"{val:6.3f}" for val in flat_spec[i:i+16]])
-            print(f"Canali [{i:4d}-{i+15:4d}]:  {chunk_vals}")
-        print("="*80 + "\n")
-        # =====================================================================
-
-
-
-        # 2. Modified Z-Score basato sulla deviazione robusta (MAD)
-        med_val = np.median(flat_spec)
-        mad_val = np.median(np.abs(flat_spec - med_val)) + 1e-12
-        mod_z = 0.6745 * (flat_spec - med_val) / mad_val
-
-        # Canali primari che superano la soglia specificata dall'utente
-        primary_peaks = np.where(mod_z > threshold)[0]
-
-        if len(primary_peaks) == 0:
-            return []
-
-        infected_channels = set()
-        
-        # Soglia per definire il rientro nel rumore sano durante la discesa (shoulder threshold)
-        shoulder_threshold = min(1.5, threshold * 0.4)
-
-        # 3. Espansione dinamica adattiva per ciascun picco trovato
-        for peak in primary_peaks:
-            if guard_band <= peak < nchan - guard_band:
-                infected_channels.add(peak)
-
-                # Espansione a SINISTRA
-                left = peak - 1
-                while left >= guard_band and mod_z[left] > shoulder_threshold:
-                    infected_channels.add(left)
-                    left -= 1
-
-                # Espansione a DESTRA
-                right = peak + 1
-                while right < nchan - guard_band and mod_z[right] > shoulder_threshold:
-                    infected_channels.add(right)
-                    right += 1
-
-        return sorted(list(infected_channels))
-
-
-
-
-   
-    
-
-
-    def run(self):
-        self.update_statusbar_signal.emit('Inspecting the Power Spectrum for outliers...')
-        self.update_button_signal.emit(False)
-        self.update_progressbar_range.emit(0, 0)
-
-        outlier_indices_pol0 = self._find_outliers(
-            self.power_spectrum_pol0,
-            self.chunk_size_pol0,
-            self.threshold_pol0
-        )
-
-        outlier_indices_pol1 = self._find_outliers(
-            self.power_spectrum_pol1,
-            self.chunk_size_pol1,
-            self.threshold_pol1
-        )
-
-        print("\n=== OUTLIER DETECTION RESULTS ===")
-        print(f" Outliers POL0 ({len(outlier_indices_pol0)} canali): {outlier_indices_pol0}")
-        print(f" Outliers POL1 ({len(outlier_indices_pol1)} canali): {outlier_indices_pol1}")
-        print("=================================\n")
-
-        self.outliers_signal_psd.emit(outlier_indices_pol0, outlier_indices_pol1)
-
-        self.update_statusbar_signal.emit('Outlier detection completed.')
-        self.update_button_signal.emit(True)
-        self.update_progressbar_value.emit(100)
-
-
-
-
-
-
-class DetectOutliers___(QThread): # without flattening
-
-    update_button_signal = pyqtSignal(bool)
-    update_statusbar_signal = pyqtSignal(str)
-    update_progressbar_value = pyqtSignal(int)
-    update_progressbar_range = pyqtSignal(int, int)
-    outliers_signal_psd = pyqtSignal(object, object)
-
-    def __init__(self, power_spectrum_pol0, chunk_size_pol0, threshold_pol0,
-                 power_spectrum_pol1, chunk_size_pol1, threshold_pol1, parent=None):
-        super().__init__(parent)
-
-        self.power_spectrum_pol0 = np.array(power_spectrum_pol0)
-        self.chunk_size_pol0 = int(chunk_size_pol0)
-        self.threshold_pol0 = float(threshold_pol0)
-
-        self.power_spectrum_pol1 = np.array(power_spectrum_pol1)
-        self.chunk_size_pol1 = int(chunk_size_pol1)
-        self.threshold_pol1 = float(threshold_pol1)
-
-
-    def _find_outliers(self, spectrum, chunk_size, threshold):
-        """
-        Rilevamento chirurgico ed adattivo degli outlier spettrali (RFI):
-        - Rileva picchi principali tramite Modified Z-Score sul gradiente/residuo.
-        - Per spike singoli di 1 canale: isola solo quel canale senza intaccare i vicini sani.
-        - Per picchi complessi/multicanale: segue la discesa del profilo (shoulder)
-          fino al rientro nella baseline sana (shoulder_threshold).
-        """
-        spectrum = np.array(spectrum, dtype=np.float64)
-        nchan = len(spectrum)
-        guard_band = 20  # Ignora bordi estremi della banda
-
-        # 1. Stima della baseline con filtro mediano
-        baseline = medfilt(spectrum, kernel_size=31)
-        baseline = np.maximum(baseline, 1e-9)
-        flat_spec = spectrum / baseline
-
-        # 2. Modified Z-Score basato sulla deviazione robusta (MAD)
-        med_val = np.median(flat_spec)
-        mad_val = np.median(np.abs(flat_spec - med_val)) + 1e-12
-        mod_z = 0.6745 * (flat_spec - med_val) / mad_val
-
-        # Canali primari che superano la soglia specificata dall'utente (es. threshold = 3.0 - 4.5)
-        primary_peaks = np.where(mod_z > threshold)[0]
-
-        if len(primary_peaks) == 0:
-            return []
-
-        infected_channels = set()
-        
-        # Soglia per definire il rientro nel rumore sano durante la discesa (shoulder threshold)
-        shoulder_threshold = min(1.5, threshold * 0.4)
-
-        # 3. Espansione dinamica adattiva per ciascun picco trovato
-        for peak in primary_peaks:
-            if guard_band <= peak < nchan - guard_band:
-                infected_channels.add(peak)
-
-                # Espansione a SINISTRA: cammina finché i canali sono sopra il rumore di fondo
-                left = peak - 1
-                while left >= guard_band and mod_z[left] > shoulder_threshold:
-                    infected_channels.add(left)
-                    left -= 1
-
-                # Espansione a DESTRA: cammina finché i canali sono sopra il rumore di fondo
-                right = peak + 1
-                while right < nchan - guard_band and mod_z[right] > shoulder_threshold:
-                    infected_channels.add(right)
-                    right += 1
-
-        return sorted(list(infected_channels))
-    
-
-
-
-
-    def _find_outliers______(self, spectrum, chunk_size, threshold):
-        """
-        Rilevamento outlier basato sul gradiente locale (np.diff).
-        Ignora la forma a trapezio della banda e rileva solo spike spettrali stretti (RFI).
-        """
-        spectrum = np.array(spectrum, dtype=np.float64)
-        n = len(spectrum)
-        
-        # Ignora i bordi estremi (es. 20 canali a sx e dx)
-        guard_band = 20
-        
-        # 1. Calcolo del gradiente tra canali adiacenti
-        diff_spec = np.diff(spectrum)
-        
-        # 2. Mediana e MAD sulla derivata dello spettro
-        med_diff = np.median(diff_spec)
-        mad_diff = np.median(np.abs(diff_spec - med_diff)) + 1e-12
-
-        # 3. Modified Z-Score sul gradiente
-        mod_z_diff = 0.6745 * np.abs(diff_spec - med_diff) / mad_diff
-        
-        # 4. Individuazione dei bordi degli spike
-        diff_outliers = np.where(mod_z_diff > threshold)[0]
-        
-        # Map sui canali originali (se il gradiente d è anomalo, il canale d o d+1 è infetto)
-        suspect_channels = set()
-        for idx in diff_outliers:
-            if guard_band <= idx < n - guard_band:
-                suspect_channels.add(idx)
-                suspect_channels.add(idx + 1)
-
-        # 5. Conferma locale: verifica che il canale sia un picco rispetto ai 10 vicini
-        final_outliers = []
-        for ch in sorted(suspect_channels):
-            left = max(0, ch - 5)
-            right = min(n, ch + 6)
-            neighbors = np.concatenate([spectrum[left:ch], spectrum[ch+1:right]])
-            
-            if len(neighbors) > 0:
-                local_med = np.median(neighbors)
-                local_mad = np.median(np.abs(neighbors - local_med)) + 1e-12
-                
-                # Deve essere un picco reale rispetto alla linea di base circostante
-                if (spectrum[ch] - local_med) / local_mad > threshold:
-                    final_outliers.append(int(ch))
-
-        return final_outliers
-
     def run(self):
         self.update_statusbar_signal.emit('Inspecting the Power Spectrum for outliers...')
         self.update_button_signal.emit(False)
@@ -982,6 +482,8 @@ class CreateFilteredTimeDomainSignal(QThread):
         self.outliers_index_pol0 = outliers_index_pol0
         self.outliers_index_pol1 = outliers_index_pol1
 
+    
+
     def safe_to_uint8(self, ifft0, ifft1, margin=127.0, max_allowed_overflow_pct=0.001):
         """
         Versione ad alte prestazioni: quantizza Pol0 e Pol1 simultaneamente 
@@ -1025,6 +527,8 @@ class CreateFilteredTimeDomainSignal(QThread):
 
         return i_scaled_0, q_scaled_0, i_scaled_1, q_scaled_1
 
+    
+
     def run(self):
         t_start_total = time.perf_counter()
 
@@ -1064,18 +568,3 @@ class CreateFilteredTimeDomainSignal(QThread):
         self.update_statusbar_signal.emit('Segnale tempo-dominio ricostruito con successo.')
         self.update_button_signal.emit(True)
         self.update_progressbar_value.emit(100)
-
-
-    
-    def get_outliers(self, threshold_1, spectrum_pol1, threshold_2, spectrum_pol2):
-
-        # Apply a median filter to get a smoothed version
-        smooth_power_pol0 = medfilt(self.psd_pol0, kernel_size=5)
-        # Identify outliers where power is way above the smoothed estimate
-        threshold = 3  # tweak as needed
-        outliers_mask = self.psd_pol0 > threshold * smooth_power_pol0
-        #print(outliers)
-        # Get indices of the outliers
-        outlier_indices = np.where(outliers_mask)[0]
-
-        print("Outlier indices:", outlier_indices)
