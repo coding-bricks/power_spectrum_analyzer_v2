@@ -12,8 +12,6 @@ from .dada_file_manager import dada_file_manager
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtWidgets import QFileDialog
 
-#from scipy.signal import medfilt
-
 
 
 class PowerSpectrumAnalyzer():
@@ -184,7 +182,6 @@ class PowerSpectrumAnalyzer():
             self.diag_dialog.activateWindow()
 
 
-
     
     def _clear_layout_widgets(self, layout):
         """Funzione ausiliaria per rimuovere e distruggere correttamente i widget dai layout PyQt."""
@@ -225,6 +222,8 @@ class PowerSpectrumAnalyzer():
         self.gp_vl_raw_data.addWidget(toolbar) 
         self.gp_vl_raw_data.addWidget(canvas)
 
+    
+
     def display_corrected_plot(self, psd_pol0, psd_pol1, fft_corrected_pol0, fft_corrected_pol1):
         # 1. Salva matrici FFT pulite
         self.fft_corrected_pol0 = fft_corrected_pol0
@@ -247,37 +246,6 @@ class PowerSpectrumAnalyzer():
         self.gp_vl_filtered_data.addWidget(canvas)
 
     
-   
-
-    
-
-    def display_corrected_plot_XXX(self, psd_pol0, psd_pol1, fft_corrected_pol0, fft_corrected_pol1):
-        # 1. Salva immediatamente le matrici FFT pulite nella classe principale
-        self.fft_corrected_pol0 = fft_corrected_pol0
-        self.fft_corrected_pol1 = fft_corrected_pol1
-
-        # 2. SE LA FINESTRA DI DIAGNOSTICA È APERTA, FORZA SUBITO IL RE-PLOT CON I DATI CLEAN
-        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
-            raw_fft = getattr(self, 'fft_pol0', None)
-            freqs = getattr(self, 'freq_axis', None)
-            # Chiamata esplicita per ricalcolare e ridisegnare il waterfall filtered
-            self.diag_dialog.update_data(raw_fft, self.fft_corrected_pol0, freqs=freqs)
-
-        # 3. Aggiorna il grafico 1D principale della GUI
-        if self.gp_vl_filtered_data.count() > 0:
-            for i in reversed(range(self.gp_vl_filtered_data.count())): 
-                self.gp_vl_filtered_data.itemAt(i).widget().deleteLater()
-
-            canvas, toolbar = self.graph.create_power_spectrum_plot(
-                psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'FILTERED DATA'
-            )
-            self.gp_vl_filtered_data.addWidget(toolbar) 
-            self.gp_vl_filtered_data.addWidget(canvas)
-
-
-
-   
-
     
     def check_iterations_input(self):
         # Get the current input value from the QLineEdit
@@ -299,7 +267,6 @@ class PowerSpectrumAnalyzer():
 
 
 
-    
     def disable_buttons(self, value):
 
         self.load_btn.setEnabled(value)
@@ -309,37 +276,7 @@ class PowerSpectrumAnalyzer():
         self.reset_btn.setEnabled(value)
 
 
-    def display_plot_XXX(self, psd_pol0, psd_pol1, fft_pol0, fft_pol1):
-        # Store the raw power spectra
-        self.psd_pol0 = psd_pol0
-        self.psd_pol1 = psd_pol1
-
-        # Store the fft coefficients for pol0 and pol1
-        self.fft_pol0 = fft_pol0
-        self.fft_pol1 = fft_pol1
-
-        np.set_printoptions(legacy='1.21')
-
-        # Se il pop-up di diagnostica è aperto, aggiornalo al volo con i nuovi dati grezzi
-        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
-            clean_fft = getattr(self, 'fft_corrected_pol0', None)
-            freqs = getattr(self, 'freq_axis', None)
-            self.diag_dialog.update_data(self.fft_pol0, clean_fft, freqs=freqs)
-
-        if(self.gp_vl_raw_data.count() > 0):
-            for i in reversed(range(self.gp_vl_raw_data.count())): 
-                self.gp_vl_raw_data.itemAt(i).widget().deleteLater()
-
-            canvas, toolbar = self.graph.create_power_spectrum_plot(psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'RAW DATA')
-            self.gp_vl_raw_data.addWidget(toolbar) 
-            self.gp_vl_raw_data.addWidget(canvas)
-
-
- 
-
-
-
-    
+   
     def filter_data(self):
 
         print(self.iterations_le, self.iterations_val)
@@ -367,6 +304,7 @@ class PowerSpectrumAnalyzer():
         # Start the thread
         self.thread_psd_pol0.start()
         # self.thread_psd_pol0.wait() # wait until the QThread is completed
+
 
 
     def get_outliers(self, outliers_pol0, outliers_pol1):
@@ -399,6 +337,7 @@ class PowerSpectrumAnalyzer():
            
         # Avvio SINGOLO del thread
         self.thread.start()
+
 
 
     def receive_time_clean_data(self, time_clean_2d_pol0, time_clean_2d_pol1):
@@ -549,7 +488,6 @@ class PowerSpectrumAnalyzer():
 
 
 
-
     def reset_buttons(self):
 
         self.load_btn.setEnabled(True)
@@ -557,37 +495,6 @@ class PowerSpectrumAnalyzer():
         self.start_btn.setEnabled(False)
         self.filter_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
-
-
-    
-    def save_data_old(self, real_uint8_pol0, imag_uint8_pol0, real_uint8_pol1, imag_uint8_pol1):
-
-        self.statusbar.showMessage('Saving data to disk. Please wait...')
-
-        # Flatten and reshape into a single-column array
-        real_uint8_pol0_col_reshaped = real_uint8_pol0.reshape(-1, 1) # Shape: (n, 1)
-        imag_uint8_pol0_col_reshaped = imag_uint8_pol0.reshape(-1, 1) # Shape: (n, 1)
-        real_uint8_pol1_col_reshaped = real_uint8_pol1.reshape(-1, 1)
-        imag_uint8_pol1_col_reshaped = imag_uint8_pol1.reshape(-1, 1)
-
-        # Stack into a 2D array with shape (3072, 2)
-        merged_data = np.hstack([real_uint8_pol0_col_reshaped, imag_uint8_pol0_col_reshaped, real_uint8_pol1_col_reshaped, imag_uint8_pol1_col_reshaped])
-
-        # Replace the corrected data in the original dataset
-        self.data[0:len(merged_data)] = merged_data[:]
-
-        data_length = len(self.data)
-
-        # _p stands for "processed"
-        file_name_p = self.destination_path + '/' + self.dada_file_object.get_fbasename[0] + "_p" + self.dada_file_object.get_fextention
-
-        print('Writing header to file ' + file_name_p + ' ...')
-        self.dada_file_object.write_DADA_header(file_name_p, self.dada_file_object.get_dict)
-        print('Writing data to file ' + file_name_p + ' ...')
-        self.dada_file_object.write_DADA_data(file_name_p, self.data, data_length)
-        #dada_obj.write_DADA_data(file_name_p, original_dada_data, data_length)
-
-        self.statusbar.showMessage('Saving data completed.')
         
 
 
@@ -636,9 +543,6 @@ class PowerSpectrumAnalyzer():
         print("==========================================================\n")
         
         self.statusbar.showMessage('Saving data completed.')
-
-
-
 
 
 
@@ -696,7 +600,6 @@ class PowerSpectrumAnalyzer():
 
 
 
-    
     def update_filter_progressbar_value(self, value: int):
 
         self.data_processing_filter_psa_pbar.setValue(value)
@@ -795,8 +698,3 @@ class PowerSpectrumAnalyzer():
         self.iterations_le.setText('')
 
         self.statusbar.showMessage('')
-       
-
-
-    
-           
