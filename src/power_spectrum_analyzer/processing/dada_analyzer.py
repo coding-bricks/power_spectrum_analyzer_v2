@@ -12,6 +12,7 @@ from scipy.signal import medfilt
 import os
 import concurrent.futures
 
+import scipy.fft
 
 
 class CreateRawSpectrum(QThread):
@@ -22,7 +23,8 @@ class CreateRawSpectrum(QThread):
     update_progressbar_range = pyqtSignal(int, int)
     result_signal_psd = pyqtSignal(object, object, object, object)
 
-    def __init__(self, iterations, npoints, nchan, data, parent=None):
+    def __init__(self, iterations, npoints, nchan, data, 
+                 enable_chunking=True, max_iterations=156250, num_blocks=1, parent=None):
         super().__init__(parent)
 
         self.iterations = iterations
@@ -30,27 +32,211 @@ class CreateRawSpectrum(QThread):
         self.nchan = nchan
         self.data = data
         
-    def run (self):
+        self.enable_chunking = enable_chunking
+        self.max_iterations = max_iterations
+        self.num_blocks = num_blocks
+
+    def run(self):
         t_start_total = time.perf_counter()
 
-        self.update_statusbar_signal.emit('FFT calculation started...')   
+        # Determina le iterazioni effettive da elaborare
+        if self.enable_chunking and self.iterations > self.max_iterations:
+            processed_iters = self.max_iterations
+            mode_str = f"SUBSET CONTIGUO ({processed_iters} iterazioni)"
+        else:
+            processed_iters = self.iterations
+            mode_str = f"FULL ({processed_iters} iterazioni)"
+
+        self.update_statusbar_signal.emit(f'FFT calculation started [{mode_str}]...')    
         self.update_button_signal.emit(False)     
 
         rows_per_step = self.npoints  # 1024
-        iterations = self.iterations
 
-        # 1. Reshape e centraggio a int16 (in-place dove possibile)
+        # 1. PREPARAZIONE VETTORIZZATA ISTANTANEA (ZERO COPY / ZERO INTERMEDII)
         t0 = time.perf_counter()
-        data = self.data[:iterations * rows_per_step].reshape(iterations, rows_per_step, 4)
+        # View a 3D senza copiare dati in RAM
+        raw_subset = self.data[:processed_iters * rows_per_step].reshape(processed_iters, rows_per_step, 4)
+
+        # Conversione diretta in numeri complessi float32 in un unico passaggio in memoria
+        # I/Q sono centrati sottraendo 128.0 (128.0 + 128.0j sul numero complesso)
+        complex_pol0 = (raw_subset[:, :, 0] + 1j * raw_subset[:, :, 1]).astype(np.complex64)
+        complex_pol0 -= (128.0 + 128.0j)
+
+        complex_pol1 = (raw_subset[:, :, 2] + 1j * raw_subset[:, :, 3]).astype(np.complex64)
+        complex_pol1 -= (128.0 + 128.0j)
+        t_prep = time.perf_counter() - t0
+
+        # 2. CALCOLO FFT MULTITHREADING (scipy.fft con 4 o più core)
+        t0 = time.perf_counter()
+        # workers=4 impiega 4 core CPU. Se vuoi usare tutti i core logici disponibili usa workers=-1
+        fft_array_pol0 = scipy.fft.fft(complex_pol0, axis=1, workers=4)
+        fft_array_pol1 = scipy.fft.fft(complex_pol1, axis=1, workers=4)
+        t_fft = time.perf_counter() - t0
+
+        # 3. SPETTRO DI POTENZA (PSD) E MEDIA INTEGRATA OTTIMIZZATA
+        t0 = time.perf_counter()
+        self.update_statusbar_signal.emit('FFT calculation completed. Squaring coefficients...')
+        self.update_progressbar_range.emit(0, 0)
+
+        # np.abs(arr)**2 in NumPy per array complessi è implementato nativamente in C 
+        # ed è più veloce di arr.real**2 + arr.imag**2
+        pol0_psd_tot = np.mean(np.abs(fft_array_pol0)**2, axis=0)
+        pol1_psd_tot = np.mean(np.abs(fft_array_pol1)**2, axis=0)
+        t_psd = time.perf_counter() - t0
+
+        t_total = time.perf_counter() - t_start_total
+
+        # --- TRACCIAMENTO TEMPI E BENCHMARK ---
+        print("\n=== BENCHMARK SPETTRO GREZZO OTTIMIZZATO (CreateRawSpectrum) ===")
+        print(f" Modalita Esecuzione:                {mode_str}")
+        print(f" Iterazioni Totali File DADA:        {self.iterations}")
+        print(f" Iterazioni Realmente Elaborate:    {processed_iters} ({(processed_iters/self.iterations)*100:.1f}% dei dati)")
+        print(f" 1. Preparazione & Complex Direct:  {t_prep*1000:.2f} ms")
+        print(f" 2. Calcolo FFT Multithread (scipy): {t_fft:.3f} s")
+        print(f" 3. Calcolo PSD e Integrazione Media:{t_psd*1000:.2f} ms")
+        print(f"----------------------------------------------------------")
+        print(f" TEMPO TOTALE SPETTRO GREZZO:        {t_total:.3f} s")
+        print("==========================================================\n")
+
+        # Store results
+        self.fft_array_pol0 = fft_array_pol0
+        self.fft_array_pol1 = fft_array_pol1
+        self.pol0_psd_tot = pol0_psd_tot
+        self.pol1_psd_tot = pol1_psd_tot
+
+        self.update_statusbar_signal.emit('Power Spectrum ready.')
+        self.update_progressbar_value.emit(processed_iters)
+
+        self.result_signal_psd.emit(self.pol0_psd_tot, self.pol1_psd_tot, fft_array_pol0, fft_array_pol1)
+
+        self.update_button_signal.emit(True)  
+        self.update_progressbar_range.emit(0, 100)
+        self.update_progressbar_value.emit(100)
+
+
+
+
+
+class CreateRawSpectrum___(QThread):
+
+    update_button_signal = pyqtSignal(bool)
+    update_statusbar_signal = pyqtSignal(str)
+    update_progressbar_value = pyqtSignal(int)
+    update_progressbar_range = pyqtSignal(int, int)
+    result_signal_psd = pyqtSignal(object, object, object, object)
+
+    def __init__(self, iterations, npoints, nchan, data, 
+                 enable_chunking=True, max_iterations=156250, num_blocks=1, parent=None):
+        super().__init__(parent)
+
+        self.iterations = iterations
+        self.npoints = npoints
+        self.nchan = nchan
+        self.data = data
         
-        # Estraiamo direttamente i canali I/Q centrandoli su 128 in formato float32 per i complessi
+        # --- PARAMETRI CHUNKING DINAMICO ---
+        self.enable_chunking = enable_chunking
+        self.max_iterations = max_iterations
+        self.num_blocks = num_blocks
+
+
+    def _extract_subset(self, rows_per_step):
+        """
+        Estrae il subset contiguo esatto richiesto dall'utente (es. prime N iterazioni).
+        """
+        actual_iters = min(self.iterations, self.max_iterations if self.enable_chunking else self.iterations)
+        subset_data = self.data[:actual_iters * rows_per_step].reshape(actual_iters, rows_per_step, 4)
+        return subset_data, actual_iters
+
+
+
+    def _extract_strided_blocks__(self, rows_per_step):
+        """
+        Estrae num_blocks distribuiti uniformemente lungo l'INTERO file DADA
+        (es. da 0 a 156.000 iterazioni).
+        """
+        total_iters = self.iterations
+        
+        if total_iters <= self.max_iterations:
+            subset_data = self.data[:total_iters * rows_per_step].reshape(total_iters, rows_per_step, 4)
+            return subset_data, total_iters
+
+        block_size = self.max_iterations // self.num_blocks
+        
+        # Genera i punti di partenza equispaziati tra 0 e l'ultimo blocco possibile dell'INTERO file
+        starts = np.linspace(0, total_iters - block_size, self.num_blocks, dtype=int)
+        
+        selected_chunks = []
+        for start in starts:
+            end = start + block_size
+            chunk = self.data[start * rows_per_step : end * rows_per_step].reshape(block_size, rows_per_step, 4)
+            selected_chunks.append(chunk)
+            
+        subset_data = np.concatenate(selected_chunks, axis=0)
+        actual_iters = subset_data.shape[0]
+        
+        return subset_data, actual_iters
+
+
+
+
+
+    def _extract_strided_blocks_old(self, rows_per_step):
+        """
+        Estrae num_blocks distribuiti uniformemente lungo l'osservazione DADA.
+        Ritorna la matrice data_reshaped contenente solo le iterazioni selezionate.
+        """
+        total_iters = self.iterations
+        
+        if total_iters <= self.max_iterations:
+            # Se le iterazioni totali sono già poche, prendiamo tutto
+            subset_data = self.data[:total_iters * rows_per_step].reshape(total_iters, rows_per_step, 4)
+            return subset_data, total_iters
+
+        block_size = self.max_iterations // self.num_blocks
+        starts = np.linspace(0, total_iters - block_size, self.num_blocks, dtype=int)
+        
+        selected_chunks = []
+        for start in starts:
+            end = start + block_size
+            chunk = self.data[start * rows_per_step : end * rows_per_step].reshape(block_size, rows_per_step, 4)
+            selected_chunks.append(chunk)
+            
+        # Concateniamo i blocchi campionati in un'unica matrice
+        subset_data = np.concatenate(selected_chunks, axis=0)
+        actual_iters = subset_data.shape[0]
+        
+        return subset_data, actual_iters
+
+
+    def run(self):
+        t_start_total = time.perf_counter()
+
+        # Determina le iterazioni effettive da elaborare (subset contiguo iniziale)
+        if self.enable_chunking and self.iterations > self.max_iterations:
+            processed_iters = self.max_iterations
+            mode_str = f"SUBSET CONTIGUO ({processed_iters} iterazioni)"
+        else:
+            processed_iters = self.iterations
+            mode_str = f"FULL ({processed_iters} iterazioni)"
+
+        self.update_statusbar_signal.emit(f'FFT calculation started [{mode_str}]...')   
+        self.update_button_signal.emit(False)     
+
+        rows_per_step = self.npoints  # 1024
+
+        # 1. Reshape e centraggio a float32 sul solo subset contiguo selezionato
+        t0 = time.perf_counter()
+        data = self.data[:processed_iters * rows_per_step].reshape(processed_iters, rows_per_step, 4)
+        
+        # Estrazione I/Q e centraggio su 128
         i0 = data[:, :, 0].astype(np.float32) - 128.0
         q0 = data[:, :, 1].astype(np.float32) - 128.0
         i1 = data[:, :, 2].astype(np.float32) - 128.0
         q1 = data[:, :, 3].astype(np.float32) - 128.0
         t_prep = time.perf_counter() - t0
 
-        # 2. Costruzione veloce del segnale complesso (view diretta)
+        # 2. Costruzione del segnale complesso
         t0 = time.perf_counter()
         complex_pol0 = i0 + 1j * q0
         complex_pol1 = i1 + 1j * q1
@@ -63,7 +249,6 @@ class CreateRawSpectrum(QThread):
         t_fft = time.perf_counter() - t0
 
         # 4. Spettro di potenza (PSD) e Media integrata
-        # Nota: (real^2 + imag^2) evita la sqrt interna di np.abs()
         t0 = time.perf_counter()
         self.update_statusbar_signal.emit('FFT calculation completed. Squaring coefficients...')
         self.update_progressbar_range.emit(0, 0)
@@ -74,15 +259,17 @@ class CreateRawSpectrum(QThread):
 
         t_total = time.perf_counter() - t_start_total
 
-        # --- TRACCIAMENTO TEMPI ---
-        print("\n=== TEMPI ESECUZIONE SPETTRO GREZZO (CreateRawSpectrum) ===")
-        print(f" Iterazioni elaborate:              {iterations}")
-        print(f" 1. Prepartazione Dati e Centraggio:{t_prep:.3f} s")
-        print(f" 2. Costruzione Segnale Complesso:  {t_complex*1000:.2f} ms")
-        print(f" 3. Calcolo FFT (Pol0 + Pol1):      {t_fft:.3f} s")
+        # --- TRACCIAMENTO TEMPI E BENCHMARK ---
+        print("\n=== BENCHMARK SPETTRO GREZZO (CreateRawSpectrum) ===")
+        print(f" Modalita Esecuzione:                {mode_str}")
+        print(f" Iterazioni Totali File DADA:        {self.iterations}")
+        print(f" Iterazioni Realmente Elaborate:    {processed_iters} ({(processed_iters/self.iterations)*100:.1f}% dei dati)")
+        print(f" 1. Preparazione Dati e Centraggio: {t_prep:.3f} s")
+        print(f" 2. Costruzione Segnale Complesso:   {t_complex*1000:.2f} ms")
+        print(f" 3. Calcolo FFT (Pol0 + Pol1):       {t_fft:.3f} s")
         print(f" 4. Calcolo PSD e Integrazione Media:{t_psd*1000:.2f} ms")
         print(f"----------------------------------------------------------")
-        print(f" TEMPO TOTALE SPETTRO GREZZO:       {t_total:.3f} s")
+        print(f" TEMPO TOTALE SPETTRO GREZZO:        {t_total:.3f} s")
         print("==========================================================\n")
 
         # Store results
@@ -91,20 +278,8 @@ class CreateRawSpectrum(QThread):
         self.pol0_psd_tot = pol0_psd_tot
         self.pol1_psd_tot = pol1_psd_tot
 
-        
-        # Imposta temporaneamente la stampa completa di NumPy
-        with np.printoptions(threshold=np.inf, precision=4, suppress=True):
-            print("\n=== PSD GREZZA POL0 (1024 canali) ===")
-            print(self.pol0_psd_tot[190:195])
-    
-            print("\n=== PSD GREZZA POL1 (1024 canali) ===")
-            print(self.pol1_psd_tot[190:195])
-
-
-
-
         self.update_statusbar_signal.emit('Power Spectrum ready.')
-        self.update_progressbar_value.emit(self.iterations)
+        self.update_progressbar_value.emit(processed_iters)
 
         self.result_signal_psd.emit(self.pol0_psd_tot, self.pol1_psd_tot, fft_array_pol0, fft_array_pol1)
 
@@ -122,15 +297,25 @@ class CreateFilteredSpectrum(QThread):
     update_progressbar_range = pyqtSignal(int, int)
     result_signal_psd = pyqtSignal(object, object, object, object)
 
-    def __init__(self, fft_pol0, fft_pol1, channels_pol0, channels_pol1, outliers_indices_pol0, outliers_indices_pol1, parent=None):
+    # --- NUOVO SEGNALE DEDICATO PER I DATI RIPARATI NEL TEMPO ---
+    result_signal_time_clean = pyqtSignal(object, object)
+
+
+    def __init__(self, raw_data, total_iterations, npoints, 
+                 outliers_indices_pol0, outliers_indices_pol1, fft_raw_pol0=None, parent=None):
         super().__init__(parent)
 
-        self.fft_pol0 = fft_pol0
-        self.fft_pol1 = fft_pol1
-        self.channels_pol0 = channels_pol0
-        self.channels_pol1 = channels_pol1
+        self.raw_data = raw_data
+        self.total_iterations = total_iterations
+        self.npoints = npoints
         self.outliers_indices_pol0 = outliers_indices_pol0
         self.outliers_indices_pol1 = outliers_indices_pol1
+        
+        # Determina la dimensione reale del SUBSET da elaborare
+        if fft_raw_pol0 is not None:
+            self.subset_iterations = fft_raw_pol0.shape[0]
+        else:
+            self.subset_iterations = total_iterations
 
     def _find_safe_channels_fast(self, outliers_indices, nchan=1024, min_dist=5):
         if not outliers_indices:
@@ -157,286 +342,449 @@ class CreateFilteredSpectrum(QThread):
 
         return safe_channels
 
+
+
     def _repair_polarization_vectorized(self, fft_data, outliers_indices, safe_channels):
-        """
-        Riparazione vettoriale istantanea senza cicli for explicit per l'estrazione casuale.
-        """
         if not outliers_indices:
             return fft_data.copy()
 
         num_iterations = fft_data.shape[0]
         num_outliers = len(outliers_indices)
 
-        # 1. Estrazione in un solo colpo dei moduli dei canali sani
-        # safe_mags ha shape: (num_iterations, num_outliers)
         safe_mags = np.abs(fft_data[:, safe_channels])
+        m = np.mean(safe_mags, axis=0)
+        s = np.std(safe_mags, axis=0)
 
-        # 2. Calcolo vettoriale di medie e deviazioni standard lungo l'asse del tempo (axis=0)
-        m = np.mean(safe_mags, axis=0)  # shape: (num_outliers,)
-        s = np.std(safe_mags, axis=0)   # shape: (num_outliers,)
+        # Generatore PCG64 ultra-veloce a 32-bit
+        rng = np.random.default_rng()
+        z_random = rng.standard_normal((num_iterations, num_outliers), dtype=np.float32)
 
-        # 3. Generazione MATRICIALE della distribuzione Gaussiana Standard N(0, 1)
-        # Una singola chiamata in C per l'intero blocco!
-        z_random = np.random.standard_normal((num_iterations, num_outliers))
-
-        # 4. Trasformazione in N(m, s) e clamp a valore positivo safe
         new_mags = np.maximum(m + z_random * s, 1e-9)
-
-        # 5. Modulo originale dei canali corrotti
         orig_mags = np.abs(fft_data[:, outliers_indices]) + 1e-9
 
-        # 6. Sostituzione in-place matriciale dei coefficienti complessi
         clean_fft = fft_data.copy()
         clean_fft[:, outliers_indices] *= (new_mags / orig_mags)
 
         return clean_fft
 
-    def run(self):
-        t_start_total = time.perf_counter()
 
-        self.update_statusbar_signal.emit('Reconstructing the FFT coefficients...')   
-        self.update_button_signal.emit(False)  
-        self.update_progressbar_range.emit(0, 0)
-
-        # 1. Ricerca canali sani (distanti almeno 5 canali)
-        t0 = time.perf_counter()
-        self.channels_pol0 = self._find_safe_channels_fast(self.outliers_indices_pol0, min_dist=5)
-        self.channels_pol1 = self._find_safe_channels_fast(self.outliers_indices_pol1, min_dist=5)
-        t_safe_channels = time.perf_counter() - t0
-
-        num_iterations = self.fft_pol0.shape[0]
-
-        # 2. Riparazione Vettoriale Gaussiana Matrice Unica
-        t0 = time.perf_counter()
-        clean_fft_pol0 = self._repair_polarization_vectorized(self.fft_pol0, self.outliers_indices_pol0, self.channels_pol0)
-        clean_fft_pol1 = self._repair_polarization_vectorized(self.fft_pol1, self.outliers_indices_pol1, self.channels_pol1)
-        t_repair = time.perf_counter() - t0
-
-        # 3. Calcolo PSD finale vettoriale
-        t0 = time.perf_counter()
-        self.update_statusbar_signal.emit('Squaring and integrating...')
-        
-        psd0_tot = np.mean(clean_fft_pol0.real**2 + clean_fft_pol0.imag**2, axis=0)
-        psd1_tot = np.mean(clean_fft_pol1.real**2 + clean_fft_pol1.imag**2, axis=0)
-        t_reconstruct_psd = time.perf_counter() - t0
-
-        t_total = time.perf_counter() - t_start_total
-
-        # --- TRACCIAMENTO TEMPI ---
-        print("\n=== TEMPI ESECUZIONE PULIZIA GAUSSIANA VETTORIALE (CreateFilteredSpectrum) ===")
-        print(f" Iterazioni elaborate:                {num_iterations}")
-        print(f" 1. Ricerca Canali Sani (min dist 5): {t_safe_channels*1000:.2f} ms")
-        print(f" 2. Replacement Gaussiano Matriciale: {t_repair*1000:.2f} ms")
-        print(f" 3. Calcolo PSD Finale:                {t_reconstruct_psd*1000:.2f} ms")
-        print(f"----------------------------------------------------------")
-        print(f" TEMPO TOTALE PULIZIA:                {t_total:.3f} s")
-        print("==========================================================\n")
-
-        self.update_statusbar_signal.emit('Power Spectrum ready.')
-        self.update_progressbar_value.emit(100)   
-
-        self.result_signal_psd.emit(psd0_tot, psd1_tot, clean_fft_pol0, clean_fft_pol1)
-
-        self.update_button_signal.emit(True)  
-        self.update_progressbar_range.emit(0, 100)
-        self.update_progressbar_value.emit(100)
-
-        # Imposta temporaneamente la stampa completa di NumPy
-        with np.printoptions(threshold=np.inf, precision=4, suppress=True):
-            print("\n=== PSD RIPARATA POL0 (1024 canali) ===")
-            print(psd0_tot[190:195])
     
-            print("\n=== PSD RIPARATA POL1 (1024 canali) ===")
-            print(psd1_tot[190:195])
+    def _repair_time_domain_vectorized(self, fft_data, threshold=3.0):
+        """
+        Riparazione RFI temporale via Random Donor Subset.
+        Seleziona vettori FFT reali da un pool di iterazioni sani:
+        - Nessun artefatto fisso/a strisce nel Waterfall 2D.
+        - Serie Temporale 1D piatta e naturale.
+        - Vettorizzato e ultra-veloce.
+        """
+        clean_fft = fft_data.copy()
+        n_iters, n_chan = fft_data.shape
+
+        # 1. Calcolo rapido della Serie Temporale Integrata 1D
+        power_2d = clean_fft.real**2 + clean_fft.imag**2
+        time_series = np.mean(power_2d, axis=1)
+
+        med_ts = np.median(time_series)
+        mad_ts = np.median(np.abs(time_series - med_ts)) + 1e-9
+        mod_z_ts = 0.6745 * (time_series - med_ts) / mad_ts
+
+        # 2. Separazione tra iterazioni anomale e Pool di Donatori Sani
+        bad_time_mask = np.abs(mod_z_ts) > threshold
+        bad_time_indices = np.where(bad_time_mask)[0]
+        
+        # Consideriamo "sani" solo i punti strettamente sotto soglia (|Z| <= threshold)
+        good_time_indices = np.where(~bad_time_mask)[0]
+
+        print(f"\n[Random Donor Subset QA] Iterazioni corrotte: {len(bad_time_indices)} | Pool donatori sani: {len(good_time_indices)}")
+
+        if len(bad_time_indices) > 0 and len(good_time_indices) > 0:
+            # 3. Estrazione casuale dal subset sano per ciascuna riga infetta
+            rng = np.random.default_rng()
+            random_donor_indices = rng.choice(good_time_indices, size=len(bad_time_indices), replace=True)
+
+            # 4. Sostituzione vettorizzata a blocchi (Zero cicli Python)
+            clean_fft[bad_time_indices, :] = clean_fft[random_donor_indices, :]
+
+        return clean_fft
+     
+       
+    def _repair_time_domain_vectorized___(self, fft_data, threshold=3.0):
+        """
+        Riparazione RFI temporale via Reference Block Copy (Donor fissa iniziale).
+        Usa le prime iterazioni sane come profilo di riferimento immutabile:
+        - Velocità di esecuzione ISTANTANEA.
+        - Zero artefatti spettrali.
+        - Serie Temporale 1D perfettamente pulita.
+        """
+        clean_fft = fft_data.copy()
+        n_iters, n_chan = fft_data.shape
+
+        # 1. Calcolo veloce della Serie Temporale Integrata 1D
+        power_2d = clean_fft.real**2 + clean_fft.imag**2
+        time_series = np.mean(power_2d, axis=1)
+
+        med_ts = np.median(time_series)
+        mad_ts = np.median(np.abs(time_series - med_ts)) + 1e-9
+        mod_z_ts = 0.6745 * (time_series - med_ts) / mad_ts
+
+        # 2. Individuazione delle iterazioni anomale
+        bad_time_mask = np.abs(mod_z_ts) > threshold
+        bad_time_indices = np.where(bad_time_mask)[0]
+
+        print(f"\n[Fixed Donor QA] Iterazioni anomale rimosse: {len(bad_time_indices)} / {n_iters}")
+
+        if len(bad_time_indices) > 0:
+            # PRENDIAMO COME RIFERIMENTO SANO LA PRIMA ITERAZIONE (o la media delle prime 10)
+            # Se la prima iterazione fosse anomala, prendiamo la prima riga sana disponibile
+            first_good_idx = 0
+            if bad_time_mask[0]:
+                good_candidates = np.where(~bad_time_mask)[0]
+                first_good_idx = good_candidates[0] if len(good_candidates) > 0 else 0
+
+            # Vettore complessi FFT di riferimento (Prima iterazione sana)
+            reference_vector = clean_fft[first_good_idx, :]
+
+            # SOSTITUZIONE ISTANTANEA A BLOCCO DI TUTTE LE ITERAZIONI ANOMALE
+            clean_fft[bad_time_indices, :] = reference_vector
+
+        return clean_fft
 
 
 
 
 
-class CreateFilteredSpectrum_old(QThread):
+    def _repair_time_domain_vectorized__(self, fft_data, threshold=3.0):
+        """
+        Riparazione RFI temporali 2D mediante Noise Replacement coerente.
+        Elimina gli spike positivi senza creare buchi o spike negativi nella serie temporale.
+        """
+        clean_fft = fft_data.copy()
+        power_2d = clean_fft.real**2 + clean_fft.imag**2
 
-    update_button_signal = pyqtSignal(bool)
-    update_statusbar_signal = pyqtSignal(str)
-    update_progressbar_value = pyqtSignal(int)
-    update_progressbar_range = pyqtSignal(int, int)
-    result_signal_psd = pyqtSignal(object, object, object, object)
+        # 1. Identifichiamo le iterazioni globalmente infette
+        time_series = np.mean(power_2d, axis=1)
+        med_ts = np.median(time_series)
+        mad_ts = np.median(np.abs(time_series - med_ts)) + 1e-9
+        mod_z_ts = 0.6745 * (time_series - med_ts) / mad_ts
 
-    def __init__(self, fft_pol0, fft_pol1, channels_pol0, channels_pol1, outliers_indices_pol0, outliers_indices_pol1, parent=None):
-        super().__init__(parent)
+        # Iterazioni sane da cui estrarre la statistica di rumore pura
+        good_indices = np.where(mod_z_ts <= threshold)[0]
+        bad_indices = np.where(mod_z_ts > threshold)[0]
 
-        self.fft_pol0 = fft_pol0
-        self.fft_pol1 = fft_pol1
-        self.channels_pol0 = channels_pol0
-        self.channels_pol1 = channels_pol1
-        self.outliers_indices_pol0 = outliers_indices_pol0
-        self.outliers_indices_pol1 = outliers_indices_pol1
+        print(f"\n[Time-Domain QA] Iterazioni corrotte rimosse e rigenerate: {len(bad_indices)} / {fft_data.shape[0]}")
 
-    def _find_safe_channels_fast(self, outliers_indices, nchan=1024, min_dist=10):
-        if not outliers_indices:
-            return []
+        if len(bad_indices) > 0 and len(good_indices) > 0:
+            # Calcolo media e deviazione standard reali/immaginarie dai canali e dai tempi sani
+            mean_real = np.mean(clean_fft[good_indices, :].real, axis=0)
+            std_real = np.std(clean_fft[good_indices, :].real, axis=0)
+            mean_imag = np.mean(clean_fft[good_indices, :].imag, axis=0)
+            std_imag = np.std(clean_fft[good_indices, :].imag, axis=0)
 
-        is_safe = np.ones(nchan, dtype=bool)
-        for out in outliers_indices:
-            start = max(0, out - min_dist + 1)
-            end = min(nchan, out + min_dist)
-            is_safe[start:end] = False
+            # Generazione del rumore sostitutivo Gaussiano
+            rng = np.random.default_rng()
+            rand_real = rng.normal(mean_real, std_real, size=(len(bad_indices), fft_data.shape[1])).astype(np.float32)
+            rand_imag = rng.normal(mean_imag, std_imag, size=(len(bad_indices), fft_data.shape[1])).astype(np.float32)
 
-        safe_channels = []
-        all_indices = np.arange(nchan)
+            # Iniezione del rumore sano al posto dei dati infetti
+            clean_fft[bad_indices, :] = rand_real + 1j * rand_imag
 
-        for out_idx in outliers_indices:
-            distances = np.abs(all_indices - out_idx)
-            distances[~is_safe] = 999999
-            best_idx = np.argmin(distances)
-            
-            if distances[best_idx] >= 999999:
-                best_idx = (out_idx + 10) % nchan
-                
-            safe_channels.append(int(best_idx))
+        return clean_fft
 
-        return safe_channels
+
+  
+
 
     def run(self):
         t_start_total = time.perf_counter()
+        max_workers = 4
 
-        self.update_statusbar_signal.emit('Reconstructing the FFT coefficients...')   
+        subset_iters = self.subset_iterations
+
+        self.update_statusbar_signal.emit(f'Calcolo FFT e filtraggio su SUBSET ({subset_iters} iterazioni)...')   
         self.update_button_signal.emit(False)  
         self.update_progressbar_range.emit(0, 0)
 
-        # 1. Ricerca rapida dei canali sani
+        # 1. Ricerca canali sani
         t0 = time.perf_counter()
-        self.channels_pol0 = self._find_safe_channels_fast(self.outliers_indices_pol0)
-        self.channels_pol1 = self._find_safe_channels_fast(self.outliers_indices_pol1)
+        channels_pol0 = self._find_safe_channels_fast(self.outliers_indices_pol0, min_dist=5)
+        channels_pol1 = self._find_safe_channels_fast(self.outliers_indices_pol1, min_dist=5)
         t_safe_channels = time.perf_counter() - t0
 
-        # 2. Copia dei coefficienti FFT originali (lavoriamo direttamente sui complessi)
+        # 2. Calcolo FFT sul SUBSET
         t0 = time.perf_counter()
-        clean_fft_pol0 = self.fft_pol0.copy()
-        clean_fft_pol1 = self.fft_pol1.copy()
-        t_copy = time.perf_counter() - t0
+        rows_per_step = self.npoints
+        subset_data = self.raw_data[:subset_iters * rows_per_step].reshape(subset_iters, rows_per_step, 4)
+        
+        i0 = subset_data[:, :, 0].astype(np.float32) - 128.0
+        q0 = subset_data[:, :, 1].astype(np.float32) - 128.0
+        i1 = subset_data[:, :, 2].astype(np.float32) - 128.0
+        q1 = subset_data[:, :, 3].astype(np.float32) - 128.0
+        
+        full_fft_pol0 = scipy.fft.fft(i0 + 1j * q0, axis=1, workers=max_workers)
+        full_fft_pol1 = scipy.fft.fft(i1 + 1j * q1, axis=1, workers=max_workers)
+        t_full_fft = time.perf_counter() - t0
 
-        num_iterations = self.fft_pol0.shape[0]
-
-        # 3. Riparazione Pol0 e Pol1 in-place (Senza calcolare le fasi!)
+        # 3. RIPARAZIONE VETTORIALE (1° Frequenza -> 2° Tempo)
         t0 = time.perf_counter()
-        for out_idx, safe_idx in zip(self.outliers_indices_pol0, self.channels_pol0):
-            # Magnitudo canale sano
-            safe_mag = np.abs(self.fft_pol0[:, safe_idx])
-            m, s = np.mean(safe_mag), np.std(safe_mag)
-            
-            # Generazione nuova magnitudo
-            new_mag = np.maximum(np.random.normal(m, s, size=num_iterations), 1e-9)
-            
-            # Magnitudo originale del canale corrotto
-            orig_mag = np.abs(self.fft_pol0[:, out_idx]) + 1e-9
-            
-            # Riscalatura diretta dei numeri complessi (mantiene la fase senza usare np.angle/np.exp)
-            clean_fft_pol0[:, out_idx] = self.fft_pol0[:, out_idx] * (new_mag / orig_mag)
-
-        for out_idx, safe_idx in zip(self.outliers_indices_pol1, self.channels_pol1):
-            safe_mag = np.abs(self.fft_pol1[:, safe_idx])
-            m, s = np.mean(safe_mag), np.std(safe_mag)
-            
-            new_mag = np.maximum(np.random.normal(m, s, size=num_iterations), 1e-9)
-            orig_mag = np.abs(self.fft_pol1[:, out_idx]) + 1e-9
-            
-            clean_fft_pol1[:, out_idx] = self.fft_pol1[:, out_idx] * (new_mag / orig_mag)
-            
+        # Passo A: Riparazione Outlier in Frequenza
+        clean_fft_pol0 = self._repair_polarization_vectorized(full_fft_pol0, self.outliers_indices_pol0, channels_pol0)
+        clean_fft_pol1 = self._repair_polarization_vectorized(full_fft_pol1, self.outliers_indices_pol1, channels_pol1)
+        
+        # Passo B: Riparazione Dominio del Tempo (applicata direttamente sulla matrice già filtrata in frequenza)
+        time_clean_fft_pol0 = self._repair_time_domain_vectorized(clean_fft_pol0, threshold=3.0)
+        time_clean_fft_pol1 = self._repair_time_domain_vectorized(clean_fft_pol1, threshold=3.0)
         t_repair = time.perf_counter() - t0
 
-        # 4. Calcolo PSD finale direttamente dai complessi puliti
+        # 4. CREAZIONE MATRICE POTENZA 2D RIPULITA DA PASSARE ALLA GUI
         t0 = time.perf_counter()
-        self.update_statusbar_signal.emit('Squaring and integrating...')
-        
-        psd0_tot = np.mean(np.abs(clean_fft_pol0)**2, axis=0)
-        psd1_tot = np.mean(np.abs(clean_fft_pol1)**2, axis=0)
+        # Matrice 2D di potenza (num_iterazioni x nchan) ripulita sia in Frequenza che nel Tempo
+        time_repaired_psd_2d_pol0 = time_clean_fft_pol0.real**2 + time_clean_fft_pol0.imag**2
+        time_repaired_psd_2d_pol1 = time_clean_fft_pol1.real**2 + time_clean_fft_pol1.imag**2
+
+        # Spettri 1D mediati dai dati riparati nel tempo
+        psd0_tot = np.mean(time_repaired_psd_2d_pol0, axis=0)
+        psd1_tot = np.mean(time_repaired_psd_2d_pol1, axis=0)
         t_reconstruct_psd = time.perf_counter() - t0
 
         t_total = time.perf_counter() - t_start_total
 
-        # --- TRACCIAMENTO TEMPI ---
-        print("\n=== TEMPI ESECUZIONE PULIZIA OPT2 (CreateFilteredSpectrum) ===")
-        print(f" Iterazioni elaborate:              {num_iterations}")
-        print(f" 1. Ricerca Canali Sani:            {t_safe_channels*1000:.2f} ms")
-        print(f" 2. Copia Buffer FFT:               {t_copy*1000:.2f} ms")
-        print(f" 3. Replacement In-Place (NO Trigonometria): {t_repair*1000:.2f} ms")
-        print(f" 4. Calcolo PSD Finale:             {t_reconstruct_psd:.3f} s")
+        # --- TRACCIAMENTO TEMPI INTEGRAZIONE E BENCHMARK ---
+        print("\n=== TEMPI ESECUZIONE PULIZIA INTEGRALE (CreateFilteredSpectrum - Multithread) ===")
+        print(f" Iterazioni Totali Riparate:         {subset_iters}")
+        print(f" CPU Worker Allocati:                {max_workers}")
+        print(f" 1. Ricerca Canali Sani:             {t_safe_channels*1000:.2f} ms")
+        print(f" 2. FFT Multithread ({max_workers} worker): {t_full_fft:.3f} s")
+        print(f" 3. Replacement Vettoriale (Freq+Time): {t_repair*1000:.2f} ms")
+        print(f" 4. Calcolo PSD Finale:              {t_reconstruct_psd*1000:.2f} ms")
         print(f"----------------------------------------------------------")
-        print(f" TEMPO TOTALE PULIZIA:              {t_total:.3f} s")
+        print(f" TEMPO TOTALE PULIZIA INTEGRALE:     {t_total:.3f} s")
         print("==========================================================\n")
 
-        self.update_statusbar_signal.emit('Power Spectrum ready.')
-        self.update_progressbar_value.emit(100)   
-
-        self.result_signal_psd.emit(psd0_tot, psd1_tot, clean_fft_pol0, clean_fft_pol1)
-
-        self.update_button_signal.emit(True)  
+        # --- EMISSIONE SEGNALI CON LA NUOVA MATRICE RIPULITA ---
+        self.update_statusbar_signal.emit('Filtered Power Spectrum ready.')
         self.update_progressbar_range.emit(0, 100)
         self.update_progressbar_value.emit(100)
 
+        # Invia la matrice FFT complessa filtrata sia in frequenza che nel tempo
+        self.result_signal_psd.emit(psd0_tot, psd1_tot, time_clean_fft_pol0, time_clean_fft_pol1)
 
+        # Invia le matrici 2D di potenza reali al segnale dedicato di diagnostica
+        if hasattr(self, 'result_signal_time_clean'):
+            self.result_signal_time_clean.emit(time_repaired_psd_2d_pol0, time_repaired_psd_2d_pol1)
 
+        self.update_button_signal.emit(True)
+    
 
-     
 
 class DetectOutliers(QThread):
 
-    # Signal to notify the main thread to disable/enable the button in the interface
     update_button_signal = pyqtSignal(bool)
-    # Signal to notify the main thread (UI) to update the status bar in the interface 
     update_statusbar_signal = pyqtSignal(str)
-    # Signal to notify the main thread (UI) to update the progressbar current value
     update_progressbar_value = pyqtSignal(int)
-     # Signal to notify the main thread (UI) to update the progressbar current range
     update_progressbar_range = pyqtSignal(int, int)
-    # Signal to notify the main thread with the result of the processing
     outliers_signal_psd = pyqtSignal(object, object)
 
     def __init__(self, power_spectrum_pol0, chunk_size_pol0, threshold_pol0,
-                 power_spectrum_pol1, chunk_size_pol1, threshold_pol1, parent=None):
+                 power_spectrum_pol1, chunk_size_pol1, threshold_pol1, enable_flattening=True, parent=None):
         super().__init__(parent)
 
         self.power_spectrum_pol0 = np.array(power_spectrum_pol0)
-        self.chunk_size_pol0 = chunk_size_pol0
-        self.threshold_pol0 = threshold_pol0
+        self.chunk_size_pol0 = int(chunk_size_pol0)
+        self.threshold_pol0 = float(threshold_pol0)
 
         self.power_spectrum_pol1 = np.array(power_spectrum_pol1)
-        self.chunk_size_pol1 = chunk_size_pol1
-        self.threshold_pol1 = threshold_pol1
+        self.chunk_size_pol1 = int(chunk_size_pol1)
+        self.threshold_pol1 = float(threshold_pol1)
 
+        # Flag per abilitare/disabilitare l'appiattimento preventivo dello spettro 1D
+        self.enable_flattening = enable_flattening  # <-- SALVATAGGIO PARAMETRO
+
+
+     
+    def _flatten_spectrum(self, spectrum, window_len=101):
+        """
+        Metodo ad-hoc per l'appiattimento chirurgico dello Spettro 1D.
+        Utilizza un filtro mediano ad ampia finestra (default 101 canali) per stimare 
+        la curvatura dell'hardware (roll-off) senza intaccare o cancellare gli spike RFI stretti.
+        Ritorna lo spettro normalizzato attorno a 1.0.
+        """
+        # Dimensione finestra forzata a valore dispari
+        size = window_len if window_len % 2 != 0 else window_len + 1
+        
+        # Stima della baseline morbida del ricevitore
+        baseline = medfilt(spectrum, kernel_size=size)
+        baseline = np.maximum(baseline, 1e-9)
+        
+        # Spettro appiattito centrato attorno a 1.0
+        return spectrum / baseline
+
+
+
+    
     def _find_outliers(self, spectrum, chunk_size, threshold):
-        n = len(spectrum)
-        # Calcoliamo quanti elementi avanzano se n non � divisibile per chunk_size
-        padding_size = (chunk_size - (n % chunk_size)) % chunk_size
-        
-        # Pad con NaN per non alterare le statistiche e mantenere la forma rettangolare
-        padded_spectrum = np.append(spectrum, np.full(padding_size, np.nan))
-        chunks = padded_spectrum.reshape(-1, chunk_size)
+        """
+        Rilevamento chirurgico ed adattivo degli outlier spettrali (RFI):
+        - Rileva picchi principali tramite Modified Z-Score sul gradiente/residuo.
+        - Applica un floor di sicurezza al MAD (safe_mad) per evitare falsi positivi su rumore integrato.
+        - Espansione ad ampiezza controllata (shoulder_threshold) per isolare le sole RFI reali.
+        """
+        spectrum = np.array(spectrum, dtype=np.float64)
+        nchan = len(spectrum)
+        guard_band = 20  # Ignora bordi estremi della banda
 
-        # 1. Calcolo Mediana e MAD per ogni riga (chunk)
-        # Usiamo nanmedian per ignorare il padding finale
-        medians = np.nanmedian(chunks, axis=1, keepdims=True)
-        mads = np.nanmedian(np.abs(chunks - medians), axis=1, keepdims=True)
+        # 1. Stima e eventuale appiattimento della baseline
+        if self.enable_flattening:
+            flat_spec = self._flatten_spectrum(spectrum, window_len=101)
+        else:
+            baseline = medfilt(spectrum, kernel_size=31)
+            baseline = np.maximum(baseline, 1e-9)
+            flat_spec = spectrum / baseline
+
+        # =====================================================================
+        # STAMPA A VIDEO DEI 1024 VALORI (spectrum / baseline)
+        # =====================================================================
+        print("\n" + "="*80)
+        print(" DIAGNOSTICA SPETTRO APPIATTITO (flat_spec = spectrum / baseline)")
+        print(f" Statistica 1024 Canali -> Media: {np.mean(flat_spec):.4f} | Mediana: {np.median(flat_spec):.4f} | Min: {np.min(flat_spec):.4f} | Max: {np.max(flat_spec):.4f}")
+        print("="*80)
         
-        # 2. Modified Z-Score (lo 0.6745 serve per allinearsi alla std gaussiana)
-        # Aggiungiamo un epsilon 1e-9 per evitare divisioni per zero
-        mod_z_scores = 0.6745 * (chunks - medians) / (mads + 1e-9)
+        # Stampa dei 1024 valori organizzati in righe da 16 canali
+        for i in range(0, nchan, 16):
+            chunk_vals = " ".join([f"{val:6.3f}" for val in flat_spec[i:i+16]])
+            print(f"Canali [{i:4d}-{i+15:4d}]:  {chunk_vals}")
+        print("="*80 + "\n")
+        # =====================================================================
+
+        # 2. Modified Z-Score con floor di sicurezza sul MAD (safe_mad)
+        med_val = np.median(flat_spec)
+        mad_val = np.median(np.abs(flat_spec - med_val)) + 1e-12
         
-        # 3. Creazione maschera boolean
-        mask = np.abs(mod_z_scores) > threshold
+        # Floor di sicurezza dell'1% (0.01) per evitare che deviazioni del rumore < 2% generino falsi positivi
+        safe_mad = max(mad_val, 0.01)
+        mod_z = 0.6745 * (flat_spec - med_val) / safe_mad
+
+        # Canali primari che superano la soglia specificata dall'utente
+        primary_peaks = np.where(mod_z > threshold)[0]
+
+        if len(primary_peaks) == 0:
+            return []
+
+        infected_channels = set()
         
-        # 4. Ricostruiamo gli indici originali
-        outlier_indices = np.where(mask.flatten()[:n])[0]
+        # Soglia di rientro controllata: ferma l'espansione al rientro nel rumore naturale (Z <= 2.0)
+        shoulder_threshold = max(2.0, threshold * 0.5)
+
+        # 3. Espansione dinamica adattiva per ciascun picco trovato
+        for peak in primary_peaks:
+            if guard_band <= peak < nchan - guard_band:
+                infected_channels.add(peak)
+
+                # Espansione a SINISTRA
+                left = peak - 1
+                while left >= guard_band and mod_z[left] > shoulder_threshold:
+                    infected_channels.add(left)
+                    left -= 1
+
+                # Espansione a DESTRA
+                right = peak + 1
+                while right < nchan - guard_band and mod_z[right] > shoulder_threshold:
+                    infected_channels.add(right)
+                    right += 1
+
+        return sorted(list(infected_channels))
+
+ 
+
+
+
+
+    def _find_outliers_old(self, spectrum, chunk_size, threshold):
+        """
+        Rilevamento chirurgico ed adattivo degli outlier spettrali (RFI):
+        - Rileva picchi principali tramite Modified Z-Score sul gradiente/residuo.
+        - Per spike singoli di 1 canale: isola solo quel canale senza intaccare i vicini sani.
+        - Per picchi complessi/multicanale: segue la discesa del profilo (shoulder)
+          fino al rientro nella baseline sana (shoulder_threshold).
+        """
+        spectrum = np.array(spectrum, dtype=np.float64)
+        nchan = len(spectrum)
+        guard_band = 20  # Ignora bordi estremi della banda
+
+        # 1. Stima e eventuale appiattimento della baseline
+        if self.enable_flattening:
+            # Richiama il metodo ad-hoc se il flag è True
+            flat_spec = self._flatten_spectrum(spectrum, window_len=101)
+        else:
+            # Comportamento originale
+            baseline = medfilt(spectrum, kernel_size=31)
+            baseline = np.maximum(baseline, 1e-9)
+            flat_spec = spectrum / baseline
+
         
-        return outlier_indices.tolist()
+        # =====================================================================
+        # STAMPA A VIDEO DEI 1024 VALORI (spectrum / baseline)
+        # =====================================================================
+        print("\n" + "="*80)
+        print(" DIAGNOSTICA SPETTRO APPIATTITO (flat_spec = spectrum / baseline)")
+        print(f" Statistica 1024 Canali -> Media: {np.mean(flat_spec):.4f} | Mediana: {np.median(flat_spec):.4f} | Min: {np.min(flat_spec):.4f} | Max: {np.max(flat_spec):.4f}")
+        print("="*80)
+        
+        # Stampa dei 1024 valori organizzati in righe da 16 canali per facilitare la lettura
+        for i in range(0, nchan, 16):
+            chunk_vals = " ".join([f"{val:6.3f}" for val in flat_spec[i:i+16]])
+            print(f"Canali [{i:4d}-{i+15:4d}]:  {chunk_vals}")
+        print("="*80 + "\n")
+        # =====================================================================
+
+
+
+        # 2. Modified Z-Score basato sulla deviazione robusta (MAD)
+        med_val = np.median(flat_spec)
+        mad_val = np.median(np.abs(flat_spec - med_val)) + 1e-12
+        mod_z = 0.6745 * (flat_spec - med_val) / mad_val
+
+        # Canali primari che superano la soglia specificata dall'utente
+        primary_peaks = np.where(mod_z > threshold)[0]
+
+        if len(primary_peaks) == 0:
+            return []
+
+        infected_channels = set()
+        
+        # Soglia per definire il rientro nel rumore sano durante la discesa (shoulder threshold)
+        shoulder_threshold = min(1.5, threshold * 0.4)
+
+        # 3. Espansione dinamica adattiva per ciascun picco trovato
+        for peak in primary_peaks:
+            if guard_band <= peak < nchan - guard_band:
+                infected_channels.add(peak)
+
+                # Espansione a SINISTRA
+                left = peak - 1
+                while left >= guard_band and mod_z[left] > shoulder_threshold:
+                    infected_channels.add(left)
+                    left -= 1
+
+                # Espansione a DESTRA
+                right = peak + 1
+                while right < nchan - guard_band and mod_z[right] > shoulder_threshold:
+                    infected_channels.add(right)
+                    right += 1
+
+        return sorted(list(infected_channels))
+
+
+
+
+   
+    
+
 
     def run(self):
-
         self.update_statusbar_signal.emit('Inspecting the Power Spectrum for outliers...')
         self.update_button_signal.emit(False)
         self.update_progressbar_range.emit(0, 0)
 
-        # Detect outliers for both polarizations
         outlier_indices_pol0 = self._find_outliers(
             self.power_spectrum_pol0,
             self.chunk_size_pol0,
@@ -449,10 +797,11 @@ class DetectOutliers(QThread):
             self.threshold_pol1
         )
 
-        print("Outliers pol0:", outlier_indices_pol0)
-        print("Outliers pol1:", outlier_indices_pol1)
+        print("\n=== OUTLIER DETECTION RESULTS ===")
+        print(f" Outliers POL0 ({len(outlier_indices_pol0)} canali): {outlier_indices_pol0}")
+        print(f" Outliers POL1 ({len(outlier_indices_pol1)} canali): {outlier_indices_pol1}")
+        print("=================================\n")
 
-        # Emit results to main thread
         self.outliers_signal_psd.emit(outlier_indices_pol0, outlier_indices_pol1)
 
         self.update_statusbar_signal.emit('Outlier detection completed.')
@@ -461,89 +810,161 @@ class DetectOutliers(QThread):
 
 
 
-class CreateFilteredTimeDomainSignal_(QThread):
+
+
+
+class DetectOutliers___(QThread): # without flattening
 
     update_button_signal = pyqtSignal(bool)
     update_statusbar_signal = pyqtSignal(str)
     update_progressbar_value = pyqtSignal(int)
-    # Emissione dei 4 buffer temporali (I0, Q0, I1, Q1) e del fattore di scala calcolato
-    result_signal_filtered_time_domain = pyqtSignal(object, object, object, object, float)
+    update_progressbar_range = pyqtSignal(int, int)
+    outliers_signal_psd = pyqtSignal(object, object)
 
-    def __init__(self, fft_corrected_pol0, fft_corrected_pol1, outliers_index_pol0, outliers_index_pol1, parent=None):
+    def __init__(self, power_spectrum_pol0, chunk_size_pol0, threshold_pol0,
+                 power_spectrum_pol1, chunk_size_pol1, threshold_pol1, parent=None):
         super().__init__(parent)
-        self.fft_corrected_pol0 = fft_corrected_pol0
-        self.fft_corrected_pol1 = fft_corrected_pol1
-        self.outliers_index_pol0 = outliers_index_pol0
-        self.outliers_index_pol1 = outliers_index_pol1
 
-    def safe_to_uint8(self, ifft0, ifft1, margin=127.0):
-        """
-        Calcola il fattore moltiplicativo massimo teorico per utilizzare 
-        il 100% della dinamica a 8-bit senza produrre clipping.
-        """
-        # 1. Trova il picco massimo assoluto tra parti Reali e Immaginarie di entrambe le polarizzazioni
-        max_val_0 = max(np.max(np.abs(ifft0.real)), np.max(np.abs(ifft0.imag)))
-        max_val_1 = max(np.max(np.abs(ifft1.real)), np.max(np.abs(ifft1.imag)))
-        global_max = max(max_val_0, max_val_1)
-        
-        # 2. Calcola il fattore di scala ottimale (spinto al massimo prima del clip)
-        if global_max > 0:
-            optimal_scale = margin / global_max
-        else:
-            optimal_scale = 1.0
+        self.power_spectrum_pol0 = np.array(power_spectrum_pol0)
+        self.chunk_size_pol0 = int(chunk_size_pol0)
+        self.threshold_pol0 = float(threshold_pol0)
 
-        # 3. Trasformazione lineare e quantizzazione uint8 (corretta indentazione)
-        r_uint8_0 = np.clip(ifft0.real * optimal_scale + 128.5, 0, 255).astype(np.uint8)
-        i_uint8_0 = np.clip(ifft0.imag * optimal_scale + 128.5, 0, 255).astype(np.uint8)
+        self.power_spectrum_pol1 = np.array(power_spectrum_pol1)
+        self.chunk_size_pol1 = int(chunk_size_pol1)
+        self.threshold_pol1 = float(threshold_pol1)
+
+
+    def _find_outliers(self, spectrum, chunk_size, threshold):
+        """
+        Rilevamento chirurgico ed adattivo degli outlier spettrali (RFI):
+        - Rileva picchi principali tramite Modified Z-Score sul gradiente/residuo.
+        - Per spike singoli di 1 canale: isola solo quel canale senza intaccare i vicini sani.
+        - Per picchi complessi/multicanale: segue la discesa del profilo (shoulder)
+          fino al rientro nella baseline sana (shoulder_threshold).
+        """
+        spectrum = np.array(spectrum, dtype=np.float64)
+        nchan = len(spectrum)
+        guard_band = 20  # Ignora bordi estremi della banda
+
+        # 1. Stima della baseline con filtro mediano
+        baseline = medfilt(spectrum, kernel_size=31)
+        baseline = np.maximum(baseline, 1e-9)
+        flat_spec = spectrum / baseline
+
+        # 2. Modified Z-Score basato sulla deviazione robusta (MAD)
+        med_val = np.median(flat_spec)
+        mad_val = np.median(np.abs(flat_spec - med_val)) + 1e-12
+        mod_z = 0.6745 * (flat_spec - med_val) / mad_val
+
+        # Canali primari che superano la soglia specificata dall'utente (es. threshold = 3.0 - 4.5)
+        primary_peaks = np.where(mod_z > threshold)[0]
+
+        if len(primary_peaks) == 0:
+            return []
+
+        infected_channels = set()
         
-        r_uint8_1 = np.clip(ifft1.real * optimal_scale + 128.5, 0, 255).astype(np.uint8)
-        i_uint8_1 = np.clip(ifft1.imag * optimal_scale + 128.5, 0, 255).astype(np.uint8)
+        # Soglia per definire il rientro nel rumore sano durante la discesa (shoulder threshold)
+        shoulder_threshold = min(1.5, threshold * 0.4)
+
+        # 3. Espansione dinamica adattiva per ciascun picco trovato
+        for peak in primary_peaks:
+            if guard_band <= peak < nchan - guard_band:
+                infected_channels.add(peak)
+
+                # Espansione a SINISTRA: cammina finché i canali sono sopra il rumore di fondo
+                left = peak - 1
+                while left >= guard_band and mod_z[left] > shoulder_threshold:
+                    infected_channels.add(left)
+                    left -= 1
+
+                # Espansione a DESTRA: cammina finché i canali sono sopra il rumore di fondo
+                right = peak + 1
+                while right < nchan - guard_band and mod_z[right] > shoulder_threshold:
+                    infected_channels.add(right)
+                    right += 1
+
+        return sorted(list(infected_channels))
+    
+
+
+
+
+    def _find_outliers______(self, spectrum, chunk_size, threshold):
+        """
+        Rilevamento outlier basato sul gradiente locale (np.diff).
+        Ignora la forma a trapezio della banda e rileva solo spike spettrali stretti (RFI).
+        """
+        spectrum = np.array(spectrum, dtype=np.float64)
+        n = len(spectrum)
+        
+        # Ignora i bordi estremi (es. 20 canali a sx e dx)
+        guard_band = 20
+        
+        # 1. Calcolo del gradiente tra canali adiacenti
+        diff_spec = np.diff(spectrum)
+        
+        # 2. Mediana e MAD sulla derivata dello spettro
+        med_diff = np.median(diff_spec)
+        mad_diff = np.median(np.abs(diff_spec - med_diff)) + 1e-12
+
+        # 3. Modified Z-Score sul gradiente
+        mod_z_diff = 0.6745 * np.abs(diff_spec - med_diff) / mad_diff
+        
+        # 4. Individuazione dei bordi degli spike
+        diff_outliers = np.where(mod_z_diff > threshold)[0]
+        
+        # Map sui canali originali (se il gradiente d è anomalo, il canale d o d+1 è infetto)
+        suspect_channels = set()
+        for idx in diff_outliers:
+            if guard_band <= idx < n - guard_band:
+                suspect_channels.add(idx)
+                suspect_channels.add(idx + 1)
+
+        # 5. Conferma locale: verifica che il canale sia un picco rispetto ai 10 vicini
+        final_outliers = []
+        for ch in sorted(suspect_channels):
+            left = max(0, ch - 5)
+            right = min(n, ch + 6)
+            neighbors = np.concatenate([spectrum[left:ch], spectrum[ch+1:right]])
             
-        return r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1, optimal_scale
+            if len(neighbors) > 0:
+                local_med = np.median(neighbors)
+                local_mad = np.median(np.abs(neighbors - local_med)) + 1e-12
+                
+                # Deve essere un picco reale rispetto alla linea di base circostante
+                if (spectrum[ch] - local_med) / local_mad > threshold:
+                    final_outliers.append(int(ch))
+
+        return final_outliers
 
     def run(self):
-        t_start_total = time.perf_counter()
-
+        self.update_statusbar_signal.emit('Inspecting the Power Spectrum for outliers...')
         self.update_button_signal.emit(False)
-        self.update_statusbar_signal.emit('Ricostruzione del segnale tempo-variante (8-bit uint)...')
+        self.update_progressbar_range.emit(0, 0)
 
-        # 1. Ripristino del centraggio dello spettro ed IFFT vettoriale su asse 1
-        t0 = time.perf_counter()
-        
-        # De-centraggio spettrale necessario se la FFT originale è stata processata con fftshift
-        fft_prep_pol0 = np.fft.ifftshift(self.fft_corrected_pol0, axes=1)
-        fft_prep_pol1 = np.fft.ifftshift(self.fft_corrected_pol1, axes=1)
+        outlier_indices_pol0 = self._find_outliers(
+            self.power_spectrum_pol0,
+            self.chunk_size_pol0,
+            self.threshold_pol0
+        )
 
-        ifft0 = np.fft.ifft(fft_prep_pol0, axis=1)
-        ifft1 = np.fft.ifft(fft_prep_pol1, axis=1)
-        t_ifft = time.perf_counter() - t0
+        outlier_indices_pol1 = self._find_outliers(
+            self.power_spectrum_pol1,
+            self.chunk_size_pol1,
+            self.threshold_pol1
+        )
 
-        # 2. Conversione sicura a uint8 con scala dinamica al massimo teorico
-        t0 = time.perf_counter()
-        r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1, optimal_scale = self.safe_to_uint8(ifft0, ifft1)
-        t_convert = time.perf_counter() - t0
+        print("\n=== OUTLIER DETECTION RESULTS ===")
+        print(f" Outliers POL0 ({len(outlier_indices_pol0)} canali): {outlier_indices_pol0}")
+        print(f" Outliers POL1 ({len(outlier_indices_pol1)} canali): {outlier_indices_pol1}")
+        print("=================================\n")
 
-        t_total = time.perf_counter() - t_start_total
+        self.outliers_signal_psd.emit(outlier_indices_pol0, outlier_indices_pol1)
 
-        num_iterations = self.fft_corrected_pol0.shape[0]
-
-        # --- TRACCIAMENTO TEMPI ---
-        print("\n=== TEMPI ESECUZIONE IFFT (CreateFilteredTimeDomainSignal) ===")
-        print(f" Iterazioni elaborate:              {num_iterations}")
-        print(f" Scala Ottimale Calcolata:           {optimal_scale:.6f}")
-        print(f" 1. Calcolo IFFT (Pol0 + Pol1):     {t_ifft:.3f} s")
-        print(f" 2. Conversione a uint8 (safe_clip): {t_convert*1000:.2f} ms")
-        print(f"----------------------------------------------------------")
-        print(f" TEMPO TOTALE IFFT:                 {t_total:.3f} s")
-        print("==========================================================\n")
-
-        # Emissione del segnale con r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1 e il fattore di scala
-        self.result_signal_filtered_time_domain.emit(r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1, optimal_scale)
-
-        self.update_statusbar_signal.emit('Segnale tempo-dominio ricostruito con successo.')
+        self.update_statusbar_signal.emit('Outlier detection completed.')
         self.update_button_signal.emit(True)
         self.update_progressbar_value.emit(100)
-
 
 
 
@@ -561,91 +982,83 @@ class CreateFilteredTimeDomainSignal(QThread):
         self.outliers_index_pol0 = outliers_index_pol0
         self.outliers_index_pol1 = outliers_index_pol1
 
-
-    
-    def safe_to_uint8(self, time_domain_complex, target_sigma_bins=32.0):
+    def safe_to_uint8(self, ifft0, ifft1, margin=127.0, max_allowed_overflow_pct=0.001):
         """
-        Calcola la scala dinamica ottimale basata sulla deviazione standard (RMS) 
-        invece del picco isolato, garantendo la massima dinamica senza abbassare la potenza.
+        Versione ad alte prestazioni: quantizza Pol0 e Pol1 simultaneamente 
+        usando le viste dirette float32 ed evitando allocazioni di memoria duplicate.
         """
-        # 1. Calcolo della deviazione standard del segnale nel tempo
-        std_real = np.std(time_domain_complex.real)
-        std_imag = np.std(time_domain_complex.imag)
-        current_std = max(std_real, std_imag)
+        # Vista memory-view a float32 per evitare l'allocazione pesante di np.abs()
+        v0 = ifft0.view(np.float32)
+        v1 = ifft1.view(np.float32)
+        
+        # 1. Picco massimo globale tra le 2 polarizzazioni
+        peak_val = max(np.max(np.abs(v0)), np.max(np.abs(v1)))
 
-        # 2. Vogliamo che la std del segnale occupi circa 32 canali uint8 (così 4*sigma = 128, perfetto per [0, 255])
-        if current_std > 0:
-            scale_factor = target_sigma_bins / current_std
-            # Limite di sicurezza superiore per evitare sovra-amplificazione su segnali piatti
-            scale_factor = min(scale_factor, 0.95)
-        else:
-            scale_factor = 0.9
+        # 2. Conteggio esatto dei campioni che sforano il margine 127.0
+        overflow_cnt_0 = np.count_nonzero(np.abs(v0) > margin)
+        overflow_cnt_1 = np.count_nonzero(np.abs(v1) > margin)
+        total_overflow_cnt = overflow_cnt_0 + overflow_cnt_1
+        
+        total_samples = v0.size + v1.size
+        overflow_pct = (total_overflow_cnt / total_samples) * 100
 
-        print('Scale Factor:', scale_factor)
-
-        # 3. Conversione a uint8
-        i_scaled = np.clip(time_domain_complex.real * scale_factor + 128.5, 0, 255).astype(np.uint8)
-        q_scaled = np.clip(time_domain_complex.imag * scale_factor + 128.5, 0, 255).astype(np.uint8)
-            
-        return i_scaled, q_scaled
-
-
-    def safe_to_uint8_old(self, time_domain_complex, margin=127.0):
-        """
-        Calcola il massimo valore del segnale complesso temporale e applica 
-        il fattore di scala dinamico ottimale per sfruttare il 100% della dinamica 
-        a 8-bit senza produrre clipping.
-        """
-        # 1. Trova il picco massimo assoluto tra parte Reale e Immaginaria
-        max_real = np.max(np.abs(time_domain_complex.real))
-        max_imag = np.max(np.abs(time_domain_complex.imag))
-        peak_val = max(max_real, max_imag)
-
-        # 2. Calcola il fattore di scala massimo teorico per evitare la saturazione
-        if peak_val > 0:
+        # 3. Decisione sulla scala
+        if overflow_pct > max_allowed_overflow_pct:
             scale_factor = margin / peak_val
+            action = f"Scala Ridotta a {scale_factor:.4f} per preservare {total_overflow_cnt} punti."
         else:
             scale_factor = 1.0
+            action = f"Scala Mantenuta a 1.0 (Solo {total_overflow_cnt} punti clippati)."
 
-        # 3. Conversione dinamica senza clipping
-        i_scaled = np.clip(time_domain_complex.real * scale_factor + 128.5, 0, 255).astype(np.uint8)
-        q_scaled = np.clip(time_domain_complex.imag * scale_factor + 128.5, 0, 255).astype(np.uint8)
+        print(f"\n  [Quantizzazione uint8 - Diagnostica Totale]")
+        print(f"  +- Picco Massimo Assoluto: {peak_val:.2f} (Soglia max: {margin})")
+        print(f"  +- Campioni Fuori Scala:   Pol0={overflow_cnt_0} | Pol1={overflow_cnt_1} (Totale: {total_overflow_cnt})")
+        print(f"  +- Percentuale Overflow:   {overflow_pct:.6f}%")
+        print(f"  +- Decisione:              {action}")
 
-        print('Scale Factor:', scale_factor)
+        # 4. Estraggo Reali (pari) ed Immaginari (dispari) mantenendo la forma 2D (num_iterations, npoints)
+        i_scaled_0 = np.clip(v0[:, 0::2] * scale_factor + 128.5, 0, 255).astype(np.uint8)
+        q_scaled_0 = np.clip(v0[:, 1::2] * scale_factor + 128.5, 0, 255).astype(np.uint8)
 
-        return i_scaled, q_scaled
+        i_scaled_1 = np.clip(v1[:, 0::2] * scale_factor + 128.5, 0, 255).astype(np.uint8)
+        q_scaled_1 = np.clip(v1[:, 1::2] * scale_factor + 128.5, 0, 255).astype(np.uint8)
+
+        return i_scaled_0, q_scaled_0, i_scaled_1, q_scaled_1
 
     def run(self):
         t_start_total = time.perf_counter()
 
-        self.update_button_signal.emit(False)
-        self.update_statusbar_signal.emit('Ricostruzione del segnale tempo-variante (8-bit uint)...')
+        # Limite impostato a 8 CPU worker per il multithreading
+        max_workers = 4
 
-        # 1. IFFT vettoriale su asse 1
+        self.update_button_signal.emit(False)
+        self.update_statusbar_signal.emit(f'Ricostruzione segnale tempo-variante (IFFT con {max_workers} CPU)...')
+
+        # 1. IFFT vettoriale vettorizzata in parallelo con scipy (8 workers)
         t0 = time.perf_counter()
-        ifft0 = np.fft.ifft(self.fft_corrected_pol0, axis=1)
-        ifft1 = np.fft.ifft(self.fft_corrected_pol1, axis=1)
+        ifft0 = scipy.fft.ifft(self.fft_corrected_pol0, axis=1, workers=max_workers)
+        ifft1 = scipy.fft.ifft(self.fft_corrected_pol1, axis=1, workers=max_workers)
         t_ifft = time.perf_counter() - t0
 
-        # 2. Conversione sicura a uint8 senza wrap-around e senza clipping
+        # 2. Quantizzazione sicura a uint8 ottimizzata in un unico passaggio
         t0 = time.perf_counter()
-        r_uint8_0, i_uint8_0 = self.safe_to_uint8(ifft0)
-        r_uint8_1, i_uint8_1 = self.safe_to_uint8(ifft1)
+        r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1 = self.safe_to_uint8(ifft0, ifft1)
         t_convert = time.perf_counter() - t0
 
         t_total = time.perf_counter() - t_start_total
-
         num_iterations = self.fft_corrected_pol0.shape[0]
 
         # --- TRACCIAMENTO TEMPI ---
-        print("\n=== TEMPI ESECUZIONE IFFT (CreateFilteredTimeDomainSignal) ===")
+        print("\n=== TEMPI ESECUZIONE IFFT (CreateFilteredTimeDomainSignal - 8 Workers) ===")
         print(f" Iterazioni elaborate:              {num_iterations}")
+        print(f" CPU Worker Allocati:                {max_workers}")
         print(f" 1. Calcolo IFFT (Pol0 + Pol1):     {t_ifft:.3f} s")
         print(f" 2. Conversione a uint8 (safe_clip): {t_convert*1000:.2f} ms")
         print(f"----------------------------------------------------------")
         print(f" TEMPO TOTALE IFFT:                 {t_total:.3f} s")
         print("==========================================================\n")
 
+        # Ritorna i 4 array 2D separati con forma esatta (156250, 1024) ciascuno
         self.result_signal_filtered_time_domain.emit(r_uint8_0, i_uint8_0, r_uint8_1, i_uint8_1)
 
         self.update_statusbar_signal.emit('Segnale tempo-dominio ricostruito con successo.')
@@ -653,10 +1066,6 @@ class CreateFilteredTimeDomainSignal(QThread):
         self.update_progressbar_value.emit(100)
 
 
-
-        
-
-    
     
     def get_outliers(self, threshold_1, spectrum_pol1, threshold_2, spectrum_pol2):
 

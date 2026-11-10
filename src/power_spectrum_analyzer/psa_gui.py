@@ -61,7 +61,7 @@ class MainUI(QMainWindow):
             self.data_processing_start_psa_pbar, self.data_processing_filter_psa_pbar, self.threshold_pol_left_lb, self.threshold_pol_right_lb,
             self.iterations_lb, self.gp_vl_raw_data, self.gp_vl_filtered_data, self.source_name_val, self.ra_val, self.dec_val,
             self.telescope_val, self.instrument_val, self.frequency_val, self.bandwidth_val, self.sampling_time_val, self.iterations_val,
-            self.iterations_per_second_val, self.points_per_iteration_val, self.spectrum_channels_val, self.filename_val, self.statusbar)
+                                                             self.iterations_per_second_val, self.points_per_iteration_val, self.spectrum_channels_val, self.filename_val, self.statusbar, self. advanced_btn)
         
         
        

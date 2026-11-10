@@ -6,6 +6,7 @@ from PyQt5.uic.uiparser import QtWidgets
 from .dada_analyzer import CreateFilteredSpectrum, CreateRawSpectrum, CreateFilteredTimeDomainSignal
 from .dada_analyzer import DetectOutliers
 from .graphcreator import GraphCreator
+from .graphcreator import AdvancedDiagnosticsDialog
 from .dada_file_manager import dada_file_manager
 
 from PyQt5.QtGui import QIntValidator
@@ -19,7 +20,7 @@ class PowerSpectrumAnalyzer():
 
     WPOINTS = ['2', '4', '8', '16', '32', '64', '128', '256', '512', '1024']
     PROCESSING_METHODS = ['Z-scores']
-    MAX_SLIDER_VAL = 7
+    MAX_SLIDER_VAL = 20
 
     selected_data_file = ""
     # Some parameters for the data processing
@@ -54,10 +55,11 @@ class PowerSpectrumAnalyzer():
             data_processing_start_psa_pbar, data_processing_filter_psa_pbar, threshold_pol_left_lb, threshold_pol_right_lb, iterations_lb,
             gp_vl_raw_data, gp_vl_filtered_data, source_name_val, ra_val, dec_val,
             telescope_val, instrument_val, frequency_val, bandwidth_val, sampling_time_val, iterations_val,
-            interations_per_second_val, points_per_iteration_val, spectrum_channels_val, filename_val, statusbar):
+                 interations_per_second_val, points_per_iteration_val, spectrum_channels_val, filename_val, statusbar, advanced_btn):
 
         #self.debug_on = debug_on
 
+        self.advanced_btn = advanced_btn
         self.load_btn = load_btn
         self.save_btn = save_btn
         self.start_btn = start_btn
@@ -129,6 +131,7 @@ class PowerSpectrumAnalyzer():
         self.reset_buttons()
         
         # Buttons actions
+        self.advanced_btn.clicked.connect(self.open_diagnostics_window)
         self.load_btn.clicked.connect(self.open_file_dialog)  # Connect the button click event to open the file dialog
         self.save_btn.clicked.connect(self.save_file_dialog)
         self.start_btn.clicked.connect(self.power_spectrum_builder)
@@ -152,7 +155,129 @@ class PowerSpectrumAnalyzer():
         self.gp_vl_raw_data.addWidget(canvas_raw_data)
         self.gp_vl_filtered_data.addWidget(canvas_filtered_data)
 
-        
+
+
+    def open_diagnostics_window(self):
+        if self.f0 > 0 and self.bw > 0 and self.number_of_channels > 0:
+            freq = np.fft.fftfreq(self.number_of_channels, 1 / self.number_of_channels)
+            self.freq_axis = np.fft.fftshift((freq / self.number_of_channels * self.bw) + self.f0)
+        else:
+            self.freq_axis = None
+
+        raw_fft = getattr(self, 'fft_pol0', None)
+        clean_fft = getattr(self, 'fft_corrected_pol0', None)
+        freqs = getattr(self, 'freq_axis', None)
+
+        # Se la finestra non esiste o è stata chiusa, la creiamo
+        if not hasattr(self, 'diag_dialog') or self.diag_dialog is None or not self.diag_dialog.isVisible():
+            self.diag_dialog = AdvancedDiagnosticsDialog(
+                parent=None,
+                fft_raw=raw_fft,
+                fft_clean=clean_fft,
+                freqs=freqs
+            )
+            self.diag_dialog.show()
+        else:
+            # Forziamo l'aggiornamento dei dati e del rendering se è già aperta
+            self.diag_dialog.update_data(raw_fft, clean_fft, freqs=freqs)
+            self.diag_dialog.raise_()
+            self.diag_dialog.activateWindow()
+
+
+
+    
+    def _clear_layout_widgets(self, layout):
+        """Funzione ausiliaria per rimuovere e distruggere correttamente i widget dai layout PyQt."""
+        if layout.count() > 0:
+            for i in reversed(range(layout.count())):
+                item = layout.takeAt(i)
+                widget = item.widget()
+                if widget is not None:
+                    # Se il widget canvas ha una figura, la puliamo esplicitamente prima della rimozione
+                    if hasattr(widget, 'figure') and widget.figure is not None:
+                        widget.figure.clf()
+                    widget.deleteLater()
+
+
+
+    def display_plot(self, psd_pol0, psd_pol1, fft_pol0, fft_pol1):
+        # Store raw spectra and FFT coefficients
+        self.psd_pol0 = psd_pol0
+        self.psd_pol1 = psd_pol1
+        self.fft_pol0 = fft_pol0
+        self.fft_pol1 = fft_pol1
+
+        np.set_printoptions(legacy='1.21')
+
+        # Aggiorna il pop-up diagnostico se aperto
+        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
+            clean_fft = getattr(self, 'fft_corrected_pol0', None)
+            freqs = getattr(self, 'freq_axis', None)
+            self.diag_dialog.update_data(self.fft_pol0, clean_fft, freqs=freqs)
+
+        # Pulizia pulita del vecchio layout RAW DATA
+        self._clear_layout_widgets(self.gp_vl_raw_data)
+
+        # Creazione nuovi canvas e toolbar
+        canvas, toolbar = self.graph.create_power_spectrum_plot(
+            psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'RAW DATA'
+        )
+        self.gp_vl_raw_data.addWidget(toolbar) 
+        self.gp_vl_raw_data.addWidget(canvas)
+
+    def display_corrected_plot(self, psd_pol0, psd_pol1, fft_corrected_pol0, fft_corrected_pol1):
+        # 1. Salva matrici FFT pulite
+        self.fft_corrected_pol0 = fft_corrected_pol0
+        self.fft_corrected_pol1 = fft_corrected_pol1
+
+        # 2. Aggiorna diagnostica se aperta
+        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
+            raw_fft = getattr(self, 'fft_pol0', None)
+            freqs = getattr(self, 'freq_axis', None)
+            self.diag_dialog.update_data(raw_fft, self.fft_corrected_pol0, freqs=freqs)
+
+        # 3. Pulizia pulita del vecchio layout FILTERED DATA
+        self._clear_layout_widgets(self.gp_vl_filtered_data)
+
+        # Creazione nuovi canvas e toolbar per FILTERED DATA
+        canvas, toolbar = self.graph.create_power_spectrum_plot(
+            psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'FILTERED DATA'
+        )
+        self.gp_vl_filtered_data.addWidget(toolbar) 
+        self.gp_vl_filtered_data.addWidget(canvas)
+
+    
+   
+
+    
+
+    def display_corrected_plot_XXX(self, psd_pol0, psd_pol1, fft_corrected_pol0, fft_corrected_pol1):
+        # 1. Salva immediatamente le matrici FFT pulite nella classe principale
+        self.fft_corrected_pol0 = fft_corrected_pol0
+        self.fft_corrected_pol1 = fft_corrected_pol1
+
+        # 2. SE LA FINESTRA DI DIAGNOSTICA È APERTA, FORZA SUBITO IL RE-PLOT CON I DATI CLEAN
+        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
+            raw_fft = getattr(self, 'fft_pol0', None)
+            freqs = getattr(self, 'freq_axis', None)
+            # Chiamata esplicita per ricalcolare e ridisegnare il waterfall filtered
+            self.diag_dialog.update_data(raw_fft, self.fft_corrected_pol0, freqs=freqs)
+
+        # 3. Aggiorna il grafico 1D principale della GUI
+        if self.gp_vl_filtered_data.count() > 0:
+            for i in reversed(range(self.gp_vl_filtered_data.count())): 
+                self.gp_vl_filtered_data.itemAt(i).widget().deleteLater()
+
+            canvas, toolbar = self.graph.create_power_spectrum_plot(
+                psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'FILTERED DATA'
+            )
+            self.gp_vl_filtered_data.addWidget(toolbar) 
+            self.gp_vl_filtered_data.addWidget(canvas)
+
+
+
+   
+
     
     def check_iterations_input(self):
         # Get the current input value from the QLineEdit
@@ -173,6 +298,7 @@ class PowerSpectrumAnalyzer():
             self.start_btn.setEnabled(False)
 
 
+
     
     def disable_buttons(self, value):
 
@@ -183,9 +309,7 @@ class PowerSpectrumAnalyzer():
         self.reset_btn.setEnabled(value)
 
 
-
-    def display_plot(self, psd_pol0, psd_pol1, fft_pol0, fft_pol1):
-
+    def display_plot_XXX(self, psd_pol0, psd_pol1, fft_pol0, fft_pol1):
         # Store the raw power spectra
         self.psd_pol0 = psd_pol0
         self.psd_pol1 = psd_pol1
@@ -194,45 +318,32 @@ class PowerSpectrumAnalyzer():
         self.fft_pol0 = fft_pol0
         self.fft_pol1 = fft_pol1
 
+        np.set_printoptions(legacy='1.21')
 
-        np.set_printoptions(legacy='1.21') # in case a print is needed it avouds formatting like np.float64(.....) for each point
+        # Se il pop-up di diagnostica è aperto, aggiornalo al volo con i nuovi dati grezzi
+        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
+            clean_fft = getattr(self, 'fft_corrected_pol0', None)
+            freqs = getattr(self, 'freq_axis', None)
+            self.diag_dialog.update_data(self.fft_pol0, clean_fft, freqs=freqs)
 
-        # Check if the vertical layout has already a widget (canvas and toolbar)
-        # Optionally, delete the widget to free up resources
-        # self.button2.deleteLater()
         if(self.gp_vl_raw_data.count() > 0):
-
             for i in reversed(range(self.gp_vl_raw_data.count())): 
                 self.gp_vl_raw_data.itemAt(i).widget().deleteLater()
 
             canvas, toolbar = self.graph.create_power_spectrum_plot(psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'RAW DATA')
-        
             self.gp_vl_raw_data.addWidget(toolbar) 
             self.gp_vl_raw_data.addWidget(canvas)
 
 
+ 
 
-    def display_corrected_plot(self, psd_pol0, psd_pol1, fft_corrected_pol0, fft_corrected_pol1):
-
-        self.fft_corrected_pol0 = fft_corrected_pol0
-        self.fft_corrected_pol1 = fft_corrected_pol1
-
-        # Check if the vertical layout has already a widget (canvas and toolbar)
-        # Optionally, delete the widget to free up resources
-        # self.button2.deleteLater()
-        if(self.gp_vl_filtered_data.count() > 0):
-
-            for i in reversed(range(self.gp_vl_filtered_data.count())): 
-                self.gp_vl_filtered_data.itemAt(i).widget().deleteLater()
-
-            canvas, toolbar = self.graph.create_power_spectrum_plot(psd_pol0, psd_pol1, self.number_of_channels, self.f0, self.bw, 'FILTERED DATA')
-        
-            self.gp_vl_filtered_data.addWidget(toolbar) 
-            self.gp_vl_filtered_data.addWidget(canvas)
 
 
     
     def filter_data(self):
+
+        print(self.iterations_le, self.iterations_val)
+
 
         # convert the slider value to the 0 - 7 scale values
         threshold_pol0 = float(self.threshold_pol_left_psa_hs.value()*7/100)
@@ -258,8 +369,6 @@ class PowerSpectrumAnalyzer():
         # self.thread_psd_pol0.wait() # wait until the QThread is completed
 
 
-    
-
     def get_outliers(self, outliers_pol0, outliers_pol1):
 
         print('Outliers_pol0:', outliers_pol0)
@@ -268,24 +377,59 @@ class PowerSpectrumAnalyzer():
         print('Outliers_pol1:', outliers_pol1)
         self.outliers_indices_pol1 = outliers_pol1 
 
-        # For each outlier get a good channel of data
-        channels_pol0 = self.outliers_indices_pol0.copy()
-        channels_pol1 = self.outliers_indices_pol1.copy()
-    
-        # Create and start the worker thread, passing the parameter (skip_calibration) to it
-        self.thread = CreateFilteredSpectrum(self.fft_pol0, self.fft_pol1, channels_pol0, channels_pol1, self.outliers_indices_pol0, self.outliers_indices_pol1)    
-        # Connect the signal from the worker thread to update the start progressbar
+        self.thread = CreateFilteredSpectrum(
+            raw_data=self.data,
+            total_iterations=int(self.iterations_le.text()),
+            npoints=self.points_per_iteration,
+            outliers_indices_pol0=self.outliers_indices_pol0,
+            outliers_indices_pol1=self.outliers_indices_pol1,
+            fft_raw_pol0=self.fft_pol0
+        )
+
+        # Connessione segnali UI e avanzamento
         self.thread.update_progressbar_value.connect(self.update_filter_progressbar_value)
-         # Connect the signal from the worker thread to update the filter progressbar range
         self.thread.update_progressbar_range.connect(self.update_filter_progressbar_range)
-        # Connect the signal from the worker thread to update the buttons in the interface
         self.thread.update_button_signal.connect(self.disable_buttons)
-        # Connect the signal from the worker thread to update the statusbar messages
         self.thread.update_statusbar_signal.connect(self.update_statusbar_message)
-        # Connect the signal from the worker thread to get the result of the processing
         self.thread.result_signal_psd.connect(self.display_corrected_plot)
-        # Start the thread
+        
+        # Connessione al segnale temporale 2D per il Waterfall del dialog
+        if hasattr(self.thread, 'result_signal_time_clean'):
+            self.thread.result_signal_time_clean.connect(self.receive_time_clean_data)
+           
+        # Avvio SINGOLO del thread
         self.thread.start()
+
+
+    def receive_time_clean_data(self, time_clean_2d_pol0, time_clean_2d_pol1):
+        """Riceve le matrici 2D corrette nel tempo e aggiorna la diagnostica avanzata."""
+        self.psd_2d_time_repaired_pol0 = time_clean_2d_pol0
+        self.psd_2d_time_repaired_pol1 = time_clean_2d_pol1
+
+        if hasattr(self, 'diag_dialog') and self.diag_dialog is not None and self.diag_dialog.isVisible():
+            raw_fft = getattr(self, 'fft_pol0', None)
+            freqs = getattr(self, 'freq_axis', None)
+            
+            # Aggiorna unicamente il dialog grafico senza lanciare nuovi thread
+            self.diag_dialog.update_data_explicit(
+                fft_raw=raw_fft, 
+                psd_clean_time_domain=self.psd_2d_time_repaired_pol0, 
+                freqs=freqs
+            )
+    
+        
+        # Connect the signal from the worker thread to update the start progressbar
+        #self.thread.update_progressbar_value.connect(self.update_filter_progressbar_value)
+         # Connect the signal from the worker thread to update the filter progressbar range
+        #self.thread.update_progressbar_range.connect(self.update_filter_progressbar_range)
+        # Connect the signal from the worker thread to update the buttons in the interface
+        #self.thread.update_button_signal.connect(self.disable_buttons)
+        # Connect the signal from the worker thread to update the statusbar messages
+        #self.thread.update_statusbar_signal.connect(self.update_statusbar_message)
+        # Connect the signal from the worker thread to get the result of the processing
+        #self.thread.result_signal_psd.connect(self.display_corrected_plot)
+        # Start the thread
+        #self.thread.start()
         #self.thread.wait()
 
 
