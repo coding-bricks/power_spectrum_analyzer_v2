@@ -31,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-psa = "power_spectrum_analyzer.psa_gui:main"
+keros = "power_spectrum_analyzer.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
