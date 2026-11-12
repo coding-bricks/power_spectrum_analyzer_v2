@@ -53,7 +53,8 @@ class PowerSpectrumAnalyzer():
             data_processing_start_psa_pbar, data_processing_filter_psa_pbar, threshold_pol_left_lb, threshold_pol_right_lb, iterations_lb,
             gp_vl_raw_data, gp_vl_filtered_data, source_name_val, ra_val, dec_val,
             telescope_val, instrument_val, frequency_val, bandwidth_val, sampling_time_val, iterations_val,
-                 interations_per_second_val, points_per_iteration_val, spectrum_channels_val, filename_val, statusbar, advanced_btn):
+                 interations_per_second_val, points_per_iteration_val, spectrum_channels_val, filename_val, statusbar, advanced_btn,
+                 default_data_dir=""):
 
         #self.debug_on = debug_on
 
@@ -90,6 +91,10 @@ class PowerSpectrumAnalyzer():
         self.spectrum_channels_val = spectrum_channels_val
         self.filename_val = filename_val
         self.statusbar = statusbar
+
+        # Initialize Data Directory
+        self.default_data_dir = default_data_dir
+        
 
         # Itialize progress bar values
         self.data_processing_start_psa_pbar.setValue(0)
@@ -441,23 +446,28 @@ class PowerSpectrumAnalyzer():
         self.points_per_iteration_val.setText(str(self.points_per_iteration))
         self.spectrum_channels_val.setText(str(self.number_of_channels))
 
+
+
+
     
-
     def open_file_dialog(self):
-        
-        self.selected_data_file, _ = QFileDialog.getOpenFileName(None, "Select a .dada File","", "Dada Files (*.dada);;All Files (*)")
+        self.selected_data_file, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select a .dada File",
+            self.default_data_dir,
+            "Dada Files (*.dada)"
+        )
 
-        if self.selected_data_file:  # Check if a file was selected
-            # Check if the selected file has the .dada extension
+        if self.selected_data_file:
             _, file_extension = os.path.splitext(self.selected_data_file)
             if file_extension.lower() == ".dada":
-                print(f"File selected: {self.selected_data_file}")  # Print the selected file path to the console
+                print(f"File selected: {self.selected_data_file}")
                 self.load_data(self.selected_data_file)
             else:
-                self.label.setText("Selected file is not a .dada file")  # Display a message if file extension is wrong
+                self.statusbar.showMessage("Selected file is not a .dada file")
                 print("Selected file is not a .dada file")
                 self.reset_buttons()
-    
+
 
 
     def power_spectrum_builder(self):
